@@ -1,6 +1,6 @@
 ## NitroSAT Performance Benchmarks  
 
-![benchmarks](benchmarks.png)
+![benchmarks](img/benchmarks.png)
 
 ### 1️⃣ Large Structured Instances  
 

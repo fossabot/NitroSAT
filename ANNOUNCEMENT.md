@@ -83,11 +83,11 @@ The future of optimization is not searching; it is physics.
 
 ## Technical Visuals (Preview)
 
-![Adelic Manifold](announcement_1.png)
+![Adelic Manifold](img/announcement_1.png)
 *Figure 1: Visualization of the Adelic Manifold and Spectral Heat Kernels.*
 
-![Phase Transition](announcement_2.png)
+![Phase Transition](img/announcement_2.png)
 *Figure 2: Real-time detection of thermodynamic phase transitions (The Mirage Trap).*
 
-![Heat Kernel Diffusion](announcement_3.png)
+![Heat Kernel Diffusion](img/announcement_3.png)
 *Figure 3: Multi-scale relaxation via heat kernel diffusion operators.*

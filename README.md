@@ -2,7 +2,7 @@
 
 # NitroSAT
 
-![NitroSAT Logo](logo.png)
+![NitroSAT Logo](img/logo.png)
 
 **NitroSAT** is a high-performance $O(M)$ MaxSAT solver. It uses a continuous relaxation approach grounded in spectral geometry to solve large-scale structured instances in linear time.
 
@@ -27,15 +27,15 @@ Unlike traditional solvers that stall on hard combinatorial bottlenecks, NitroSA
 
 NitroSAT maps the Boolean satisfiability problem to an energy landscape, using spectral initialization and Branch-Aware Holonomy Annealing (BAHA) to navigate complex basins.
 
-![NitroSAT Mechanism](howitworks.png)
+![NitroSAT Mechanism](img/howitworks.png)
 
 ## 📊 Benchmarks & Scaling
 
 NitroSAT demonstrates consistent $O(M)$ scaling and high satisfaction rates across diverse instance categories. For a full breakdown of quantitative results, see [BENCHMARKS.md](BENCHMARKS.md).
 
-![Benchmarks Summary](benchmarks.png)
-![Satisfaction Distribution](satisfaction_hist.png)
-![Scaling Analysis](scaling_plot.png)
+![Benchmarks Summary](img/benchmarks.png)
+![Satisfaction Distribution](img/satisfaction_hist.png)
+![Scaling Analysis](img/scaling_plot.png)
 
 
 ## Quick Start
