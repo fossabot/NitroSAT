@@ -1,0 +1,29 @@
+# Benchmark outputs
+benchmark_output.txt
+benchmark_results.csv
+
+# Backup files
+*.bk
+.nitro.bk
+
+# ZIP files
+*.zip
+
+# Compiled files
+*.so
+*.dll
+*.exe
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Paper / research artifacts
+18096758/
+nitrosat
