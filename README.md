@@ -24,6 +24,8 @@ Unlike traditional solvers that stall on hard combinatorial bottlenecks, NitroSA
 - **Scale**: Perfectly solves a 350,000-clause clique coloring instance in ~3.5s.
 - **Zero Tuning**: works out-of-the-box on Scheduling, Ramsey, Coloring, and N-Queens.
 
+If you have a constraint satisfaction problem with 100k+ clauses and need a fast approximate solution, try this. It won't guarantee 100% but it'll get you 99.5%+ in seconds.
+
 ## 🔬 Verified Math
 
 NitroSAT's prime-weighted clause approach has been empirically verified. Independent ablation studies confirm:
@@ -34,28 +36,13 @@ NitroSAT's prime-weighted clause approach has been empirically verified. Indepen
 
 See [MATH.md](MATH.md#empirical-verification-2026-independent-audit) for the complete verification study.
 
-## 🚀 Universal NP Approximator
+## Highlights
 
-Any NP-Complete problem translatable to CNF is solvable in linear time. Proven domains include:
 
 - 🖥️ **Chip Verification** - Solves **512×512-bit Hardware Multiplier (2,617,349 clauses)** in **5.92 seconds**
 - 🌐 **Graph Theory** - K-Clique, Coloring, Dominating Sets at 99.9%+ satisfaction
 - 📦 **Logistics & Scheduling** - Pigeonhole, Bin Packing, Shift Matching
 
-## 💡 Pro-Tip: Pipe from Generators
-
-NitroSAT supports standard input (`-`). Pipe massive NP-Complete problems directly from generators such as [cnfgen](https://github.com/MassimoLauria/cnfgen):
-
-```bash
-# Solve hardware multiplier verification (40,453 clauses) instantly
-cnfgen kclique 5 gnm 25 50 | ./nitrosat -
-
-# Solve 128-bit multiplier (162,821 clauses) in under a second
-python3 -c "
-def gen(n):
-    # Generate n×n multiplier CNF...
-" | ./nitrosat -
-```
 
 ## 🎨 How it Works
 
