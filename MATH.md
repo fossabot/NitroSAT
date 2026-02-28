@@ -1,4 +1,8 @@
-Here is the formal mathematical construction uniting the Inverted Poincaré Disk, the Prime Partitioning Problem, and the Riemann Hypothesis.
+# Constraint Satisfaction as Langevin Flow on the Adelic Manifold: Prime Weights, Spectral Gaps, and a Connection to the Riemann Hypothesis
+
+What if the reason NP-hard problems are hard is the same reason primes are irregular?
+
+This document presents a formal mathematical framework in which constraint satisfaction, prime number distribution, and the Riemann Hypothesis are not analogies — they are the same object viewed from different angles. A SAT solver becomes a gradient flow on a Riemannian manifold. Clause weights become prime masses on the boundary. And the stability of the solver at scale becomes a statement equivalent to RH.
 
 ### 1. The Geometric Space: Inverted Poincaré Disk ($\mathbb{D}^*$)
 ![Figure 1: The Inverted Poincaré Disk](img/math_disk.png)
