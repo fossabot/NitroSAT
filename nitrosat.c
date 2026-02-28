@@ -792,12 +792,6 @@ static int compute_gradients(NitroSat *ns)
         int e = ns->cl_offs[c+1];
         int k = e - s;
 
-        /* Cheat Code 2: Early exit for well-satisfied clauses */
-        /* If clause has 2+ satisfied literals, barrier gradient is negligible */
-        if (ns->sat_counts[c] >= 2) {
-            continue;
-        }
-
         double violation = 1.0;
         int sat = 0;
 
