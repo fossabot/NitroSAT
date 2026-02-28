@@ -1,5 +1,9 @@
 # Constraint Satisfaction as Langevin Flow on the Adelic Manifold: Prime Weights, Spectral Gaps, and a Connection to the Riemann Hypothesis
 
+**Author**: Sethurathienam Iyer ([ORCID: 0009-0008-5446-2856](https://orcid.org/0009-0008-5446-2856))  
+**Date**: 28th Feb 2026  
+**Zenodo**: [https://doi.org/10.5281/zenodo.18753235](https://doi.org/10.5281/zenodo.18753235)
+
 What if the reason NP-hard problems are hard is the same reason primes are irregular?
 
 This document presents a formal mathematical framework in which constraint satisfaction, prime number distribution, and the Riemann Hypothesis are not analogies — they are the same object viewed from different angles. A SAT solver becomes a gradient flow on a Riemannian manifold. Clause weights become prime masses on the boundary. And the stability of the solver at scale becomes a statement equivalent to RH.
