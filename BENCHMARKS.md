@@ -316,14 +316,30 @@ Production API testing with DEFEKT diagnostics and multi-engine comparison.
 
 ---
 
+### 7. Frustrated Small-World Lattice (The "CDCL Killer")
+
+A massive grid coloring problem with random "teleporter" connections that destroys locality. This stresses information propagation across long-range dependencies.
+
+| Size | Colors | Variables | Clauses | Satisfaction | Time |
+|------|--------|-----------|---------|-------------|------|
+| 100×100 | 3 | 30,000 | 100,000 | 99.91% | 31.3s |
+| 100×100 | 4 | 40,000 | 150,000 | **100%** | 2.15s |
+| 200×200 | 4 | 160,000 | 601,596 | **100%** | 27.6s |
+| **300×300** | **4** | **360,000** | **1,354,800** | **100%** | **62.75s** |
+
+**Key Finding:** With 4 colors (Four Color Theorem regime), NitroSAT easily solves million-clause grid coloring problems. The "teleporter" constraints create global dependencies that destroy CDCL locality - but Heat Kernel Diffusion handles them naturally.
+
+---
+
 ### Verification Summary
 
 | Metric | Value |
 |--------|-------|
 | Total instances tested | 70+ |
 | Average satisfaction | **99.65%** |
-| Perfect solves (100%) | 45/70 (64%) |
+| Perfect solves (100%) | 48/74 (65%) |
 | Hardware verification (100%) | 15/15 (100%) |
+| Lattice (4-color, 300×300) | **1,354,800 clauses** (100%) in 63s |
 | Prime weight speedup | **4x** on structured problems |
 | Largest instance solved | **2,617,349 clauses** (512×512 multiplier) |
 
