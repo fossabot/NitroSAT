@@ -53,6 +53,70 @@ gcc -O3 -march=native -std=c99 nitrosat.c -o nitrosat -lm
 ./nitrosat tests/rand3sat/rand3sat_50_200.cnf
 ```
 
+### 3. JSON Diagnostics Mode
+Use `--json` to get a structured JSON payload with assignment, confidence vector, latency breakdown, and full thermodynamic diagnostics.
+
+```bash
+./nitrosat problem.cnf --json
+```
+
+<details>
+<summary><b>Example JSON Output</b> (click to expand)</summary>
+
+```json
+{
+  "status": "SATISFIED",
+  "satisfaction_rate": 1.0,
+  "satisfied": 425,
+  "unsatisfied": 0,
+  "variables": 150,
+  "clauses": 425,
+  "assignment": [-1, -2, 3, -4, -5, 6, "..."],
+  "confidence": [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, "..."],
+  "latency": {
+    "total_ms": 54.12,
+    "throughput": "7.9K clauses/sec",
+    "breakdown": {
+      "initialization_ms": 0.48,
+      "langevin_flow_ms": 53.64,
+      "topo_repair_ms": 0.0,
+      "adelic_saturation_ms": 0.0,
+      "core_decomposition_ms": 0.0,
+      "walksat_ms": 0.0
+    }
+  },
+  "diagnostics": {
+    "thermodynamics": {
+      "final_beta": 0.5,
+      "critical_beta": 0.009792,
+      "entropy_level": 0.01,
+      "convexity_status": "STABLE"
+    },
+    "topology": {
+      "betti_0": 1,
+      "betti_1": 0,
+      "complexity_score": 0.0,
+      "persistence_events": 86
+    },
+    "prime_stability": {
+      "aggregation_error": 0.00004,
+      "chebyshev_bias": "STABLE"
+    },
+    "blame": []
+  }
+}
+```
+</details>
+
+**Key fields:**
+| Field | Description |
+|-------|-------------|
+| `confidence` | Raw continuous values (0.0–1.0) before rounding to Boolean |
+| `critical_beta` | Predicted phase transition point from the Prime Number Theorem |
+| `convexity_status` | `STABLE` (convex regime) or `NON_CONVEX` (glassy phase) |
+| `betti_0` / `betti_1` | Topological invariants of the unsatisfied clause complex |
+| `blame` | Top-20 unsatisfied clauses ranked by prime weight (UNSAT debugging) |
+
 ## 🛠 Requirements
 - GCC or Any C99 Compiler
 - standard `math.lib` (`-lm`)

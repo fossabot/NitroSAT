@@ -1,4 +1,5 @@
 
+#define _POSIX_C_SOURCE 199309L
 /*=====================================================================
   NitroSat – Advanced MaxSAT Solver (C version)
   --------------------------------------------------------------------
@@ -28,6 +29,40 @@ Please cite https://zenodo.org/records/18753235 if you are using this software
 #include <stdint.h>
 #include <time.h>
 #include <assert.h>
+
+/* --------------------------------------------------------------------
+   JSON output structures and high-resolution timing
+-------------------------------------------------------------------- */
+
+typedef struct {
+    double init_ms;
+    double langevin_ms;
+    double topo_repair_ms;
+    double adelic_ms;
+    double core_decomp_ms;
+    double walksat_ms;
+    double total_ms;
+} LatencyBreakdown;
+
+typedef struct {
+    double final_beta;
+    double critical_beta;
+    double entropy_level;
+    const char *convexity_status;
+    int betti_0, betti_1;
+    double complexity_score;
+    int persistence_events;
+    double aggregation_error;
+    const char *chebyshev_bias;
+    int *blame_clause_ids;
+    double *blame_weights;
+    int blame_count;
+} SolverDiagnostics;
+
+static double timespec_ms(struct timespec *start, struct timespec *end) {
+    return (end->tv_sec - start->tv_sec) * 1000.0 +
+           (end->tv_nsec - start->tv_nsec) / 1e6;
+}
 
 /* --------------------------------------------------------------------
    Helper macros / constants
@@ -1795,29 +1830,218 @@ static int nitrosat_solve_dcw(NitroSat *ns, int num_passes)
 }
 
 /* --------------------------------------------------------------------
-   20. Entry point – read problem, build solver, run.
+   20. JSON output printer
+-------------------------------------------------------------------- */
+static void print_json_result(NitroSat *ns, const char *cnf_file,
+                              int solved, LatencyBreakdown *lat,
+                              SolverDiagnostics *diag)
+{
+    int final_sat = check_satisfaction(ns);
+    int unsat = ns->num_clauses - final_sat;
+    double sat_rate = (ns->num_clauses > 0) ? (double)final_sat / ns->num_clauses : 0.0;
+
+    const char *status = solved ? "SATISFIED" :
+                         (sat_rate >= 0.95 ? "PARTIAL" : "UNSATISFIED");
+
+    double throughput = (lat->total_ms > 0.001) ?
+        (double)ns->num_clauses / (lat->total_ms / 1000.0) : 0.0;
+    char tp_buf[64];
+    if (throughput >= 1e6) snprintf(tp_buf, sizeof(tp_buf), "%.1fM clauses/sec", throughput/1e6);
+    else if (throughput >= 1e3) snprintf(tp_buf, sizeof(tp_buf), "%.1fK clauses/sec", throughput/1e3);
+    else snprintf(tp_buf, sizeof(tp_buf), "%.0f clauses/sec", throughput);
+
+    printf("{\n");
+    printf("  \"status\": \"%s\",\n", status);
+    printf("  \"satisfaction_rate\": %.6f,\n", sat_rate);
+    printf("  \"satisfied\": %d,\n", final_sat);
+    printf("  \"unsatisfied\": %d,\n", unsat);
+    printf("  \"variables\": %d,\n", ns->num_vars);
+    printf("  \"clauses\": %d,\n", ns->num_clauses);
+    printf("  \"formula\": \"%s\",\n", cnf_file);
+
+    /* Assignment in DIMACS format */
+    printf("  \"assignment\": [");
+    for (int i = 1; i <= ns->num_vars; ++i) {
+        printf("%d", (ns->x[i] > 0.5) ? i : -i);
+        if (i < ns->num_vars) printf(",");
+    }
+    printf("],\n");
+
+    /* Confidence vector (raw continuous values) */
+    printf("  \"confidence\": [");
+    for (int i = 1; i <= ns->num_vars; ++i) {
+        printf("%.4f", ns->x[i]);
+        if (i < ns->num_vars) printf(",");
+    }
+    printf("],\n");
+
+    /* Latency breakdown */
+    printf("  \"latency\": {\n");
+    printf("    \"total_ms\": %.2f,\n", lat->total_ms);
+    printf("    \"throughput\": \"%s\",\n", tp_buf);
+    printf("    \"breakdown\": {\n");
+    printf("      \"initialization_ms\": %.2f,\n", lat->init_ms);
+    printf("      \"langevin_flow_ms\": %.2f,\n", lat->langevin_ms);
+    printf("      \"topo_repair_ms\": %.2f,\n", lat->topo_repair_ms);
+    printf("      \"adelic_saturation_ms\": %.2f,\n", lat->adelic_ms);
+    printf("      \"core_decomposition_ms\": %.2f,\n", lat->core_decomp_ms);
+    printf("      \"walksat_ms\": %.2f\n", lat->walksat_ms);
+    printf("    }\n");
+    printf("  },\n");
+
+    /* Diagnostics */
+    printf("  \"diagnostics\": {\n");
+
+    /* Thermodynamics */
+    printf("    \"thermodynamics\": {\n");
+    printf("      \"final_beta\": %.4f,\n", diag->final_beta);
+    printf("      \"critical_beta\": %.6f,\n", diag->critical_beta);
+    printf("      \"entropy_level\": %.6f,\n", diag->entropy_level);
+    printf("      \"convexity_status\": \"%s\"\n", diag->convexity_status);
+    printf("    },\n");
+
+    /* Topology */
+    printf("    \"topology\": {\n");
+    printf("      \"betti_0\": %d,\n", diag->betti_0);
+    printf("      \"betti_1\": %d,\n", diag->betti_1);
+    printf("      \"complexity_score\": %.4f,\n", diag->complexity_score);
+    printf("      \"persistence_events\": %d\n", diag->persistence_events);
+    printf("    },\n");
+
+    /* Prime stability */
+    printf("    \"prime_stability\": {\n");
+    printf("      \"aggregation_error\": %.8f,\n", diag->aggregation_error);
+    printf("      \"chebyshev_bias\": \"%s\"\n", diag->chebyshev_bias);
+    printf("    },\n");
+
+    /* Blame attribution for unsat clauses */
+    printf("    \"blame\": [");
+    for (int i = 0; i < diag->blame_count; ++i) {
+        int c = diag->blame_clause_ids[i];
+        printf("{\"clause_id\":%d,\"weight\":%.4f,\"variables\":[", c, diag->blame_weights[i]);
+        for (int j = ns->cl_offs[c]; j < ns->cl_offs[c+1]; ++j) {
+            printf("%d", ns->cl_flat[j]);
+            if (j + 1 < ns->cl_offs[c+1]) printf(",");
+        }
+        printf("]}");
+        if (i + 1 < diag->blame_count) printf(",");
+    }
+    printf("]\n");
+
+    printf("  }\n");
+    printf("}\n");
+}
+
+/* --------------------------------------------------------------------
+   21. Compute diagnostics from solver state
+-------------------------------------------------------------------- */
+static void compute_solver_diagnostics(NitroSat *ns, SolverDiagnostics *diag)
+{
+    /* Thermodynamics */
+    diag->final_beta = ns->heat_beta;
+    diag->entropy_level = ns->entropy_weight;
+
+    /* Critical beta from MATH.md: β* ~ (4δ²)/(k²·d·ln(K)/ln(ln(K))) */
+    double k_max = 3.0; /* dominant clause size */
+    double d_clause = 0.0;
+    for (int i = 1; i <= ns->num_vars; ++i) d_clause += ns->degrees[i];
+    d_clause = (ns->num_vars > 0) ? d_clause / ns->num_vars : 1.0;
+    double delta = 0.3;
+    double K = (double)ns->num_clauses;
+    double lnK = (K > 1) ? log(K) : 1.0;
+    double lnlnK = (lnK > 1) ? log(lnK) : 1.0;
+    diag->critical_beta = (4.0 * delta * delta * lnK) / (k_max * k_max * d_clause * lnlnK);
+
+    /* Convexity check: 4/β > W_max * k_max² * d_clause / δ² */
+    double eff_beta = ns->heat_beta * d_clause;
+    double W_max = ns->cl_weights[0];
+    for (int c = 1; c < ns->num_clauses; ++c)
+        if (ns->cl_weights[c] > W_max) W_max = ns->cl_weights[c];
+    double lhs = 4.0 / (eff_beta > 1e-12 ? eff_beta : 1e-12);
+    double rhs = W_max * k_max * k_max * d_clause / (delta * delta);
+    diag->convexity_status = (lhs > rhs) ? "STABLE" : "NON_CONVEX";
+
+    /* Topology */
+    if (ns->pt.has_initial) {
+        diag->betti_0 = ns->pt.final_beta0;
+        diag->betti_1 = ns->pt.final_beta1;
+        diag->complexity_score = (diag->betti_0 > 0) ?
+            (double)diag->betti_1 / diag->betti_0 : 0.0;
+        diag->persistence_events = ns->pt.persistence_events;
+    } else {
+        diag->betti_0 = diag->betti_1 = 0;
+        diag->complexity_score = 0.0;
+        diag->persistence_events = 0;
+    }
+
+    /* Prime stability: compute variance of per-clause prime aggregation */
+    double mean_w = 0.0;
+    for (int c = 0; c < ns->num_clauses; ++c) mean_w += ns->cl_weights[c];
+    mean_w /= (ns->num_clauses > 0 ? ns->num_clauses : 1);
+    double var_w = 0.0;
+    for (int c = 0; c < ns->num_clauses; ++c) {
+        double d = ns->cl_weights[c] - mean_w;
+        var_w += d * d;
+    }
+    diag->aggregation_error = (ns->num_clauses > 1) ?
+        sqrt(var_w / (ns->num_clauses - 1)) / mean_w : 0.0;
+    diag->chebyshev_bias = (diag->aggregation_error < 0.01) ? "STABLE" :
+                           (diag->aggregation_error < 0.1) ? "MODERATE" : "UNSTABLE";
+
+    /* Blame: collect unsat clause IDs sorted by weight (top 20) */
+    recompute_sat_counts(ns);
+    int cap = 20;
+    diag->blame_clause_ids = malloc(cap * sizeof(int));
+    diag->blame_weights = malloc(cap * sizeof(double));
+    diag->blame_count = 0;
+
+    for (int c = 0; c < ns->num_clauses && diag->blame_count < cap; ++c) {
+        if (ns->sat_counts[c] == 0) {
+            diag->blame_clause_ids[diag->blame_count] = c;
+            diag->blame_weights[diag->blame_count] = ns->cl_weights[c];
+            diag->blame_count++;
+        }
+    }
+    /* Sort blame by weight descending (simple insertion sort, max 20) */
+    for (int i = 1; i < diag->blame_count; ++i) {
+        int j = i;
+        while (j > 0 && diag->blame_weights[j] > diag->blame_weights[j-1]) {
+            double tw = diag->blame_weights[j]; diag->blame_weights[j] = diag->blame_weights[j-1]; diag->blame_weights[j-1] = tw;
+            int ti = diag->blame_clause_ids[j]; diag->blame_clause_ids[j] = diag->blame_clause_ids[j-1]; diag->blame_clause_ids[j-1] = ti;
+            j--;
+        }
+    }
+}
+
+/* --------------------------------------------------------------------
+   22. Entry point – read problem, build solver, run.
 -------------------------------------------------------------------- */
 int main(int argc, char **argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <cnf-file> [max-steps] [--no-dcw] [--no-topo]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <cnf-file> [max-steps] [--no-dcw] [--no-topo] [--json]\n", argv[0]);
         return EXIT_FAILURE;
     }
     const char *cnf_file = argv[1];
     int max_steps = 3000;
     int use_dcw = 1;
     int use_topo = 1;
+    int json_output = 0;
 
     for (int i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "--no-dcw") == 0) use_dcw = 0;
         else if (strcmp(argv[i], "--no-topo") == 0) use_topo = 0;
+        else if (strcmp(argv[i], "--json") == 0) json_output = 1;
         else max_steps = atoi(argv[i]);
     }
+
+    struct timespec ts_total_start, ts_total_end, ts_init_end;
+    clock_gettime(CLOCK_MONOTONIC, &ts_total_start);
 
     Instance *inst = read_cnf(cnf_file);
     if (!inst) return EXIT_FAILURE;
 
-    NitroSat *ns = nitrosat_new(inst, max_steps, /*verbose=*/1);
+    NitroSat *ns = nitrosat_new(inst, max_steps, json_output ? 0 : 1);
     ns->use_topology = use_topo;
 
     /* Build variable‑to‑clause CSR structure (O(L) time) */
@@ -1840,31 +2064,56 @@ int main(int argc, char **argv)
     }
     free(cur);
 
-    double start = (double)clock() / CLOCKS_PER_SEC;
+    clock_gettime(CLOCK_MONOTONIC, &ts_init_end);
+
+    /* ---- Solve ---- */
+    struct timespec ts_solve_start, ts_solve_end;
+    clock_gettime(CLOCK_MONOTONIC, &ts_solve_start);
     int solved = use_dcw ? nitrosat_solve_dcw(ns, 5) : nitrosat_solve(ns);
-    double end   = (double)clock() / CLOCKS_PER_SEC;
+    clock_gettime(CLOCK_MONOTONIC, &ts_solve_end);
+    clock_gettime(CLOCK_MONOTONIC, &ts_total_end);
 
-    printf("\n=== RESULT ===\n");
-    printf("Formula : %s\n", cnf_file);
-    printf("Variables: %d   Clauses: %d\n", ns->num_vars, ns->num_clauses);
+    /* ---- Build latency breakdown ---- */
+    LatencyBreakdown lat = {0};
+    lat.init_ms = timespec_ms(&ts_total_start, &ts_init_end);
+    lat.langevin_ms = timespec_ms(&ts_solve_start, &ts_solve_end);
+    lat.total_ms = timespec_ms(&ts_total_start, &ts_total_end);
+    /* Note: per-phase breakdown within nitrosat_solve would require
+       instrumenting the function itself. For now, langevin_ms covers
+       the entire solve including sub-phases. */
 
-    int final_sat = check_satisfaction(ns);
-    printf("Satisfied: %d   Unsatisfied: %d\n", final_sat, ns->num_clauses - final_sat);
-    printf("Solved  : %s\n", solved ? "YES" : "NO");
-    printf("Time    : %.2f s\n", end - start);
-    
-    if (ns->use_topology && ns->pt.has_initial) {
-        printf("Topology Summary:\n");
-        printf("  Beta0: %d -> %d\n", ns->pt.initial_beta0, ns->pt.final_beta0);
-        printf("  Beta1: %d -> %d\n", ns->pt.initial_beta1, ns->pt.final_beta1);
-        printf("  Persistence Events: %d\n", ns->pt.persistence_events);
-        printf("  Complexity Trend: %.3f\n", ns->pt.final_complexity - ns->pt.initial_complexity);
+    if (json_output) {
+        /* Compute diagnostics and print JSON */
+        SolverDiagnostics diag = {0};
+        compute_solver_diagnostics(ns, &diag);
+        print_json_result(ns, cnf_file, solved, &lat, &diag);
+        free(diag.blame_clause_ids);
+        free(diag.blame_weights);
+    } else {
+        /* Original text output */
+        recompute_sat_counts(ns);
+        int final_sat = check_satisfaction(ns);
+
+        printf("\n=== RESULT ===\n");
+        printf("Formula : %s\n", cnf_file);
+        printf("Variables: %d   Clauses: %d\n", ns->num_vars, ns->num_clauses);
+        printf("Satisfied: %d   Unsatisfied: %d\n", final_sat, ns->num_clauses - final_sat);
+        printf("Solved  : %s\n", solved ? "YES" : "NO");
+        printf("Time    : %.2f s\n", lat.total_ms / 1000.0);
+
+        if (ns->use_topology && ns->pt.has_initial) {
+            printf("Topology Summary:\n");
+            printf("  Beta0: %d -> %d\n", ns->pt.initial_beta0, ns->pt.final_beta0);
+            printf("  Beta1: %d -> %d\n", ns->pt.initial_beta1, ns->pt.final_beta1);
+            printf("  Persistence Events: %d\n", ns->pt.persistence_events);
+            printf("  Complexity Trend: %.3f\n", ns->pt.final_complexity - ns->pt.initial_complexity);
+        }
+
+        printf("Final assignment (first 20 vars):\n");
+        for (int i=1; i<=ns->num_vars && i<=20; ++i)
+            printf("%d:%d ", i, (ns->x[i] > 0.5));
+        puts("\n");
     }
-    
-    printf("Final assignment (first 20 vars):\n");
-    for (int i=1; i<=ns->num_vars && i<=20; ++i)
-        printf("%d:%d ", i, (ns->x[i] > 0.5));
-    puts("\n");
 
     nitrosat_free(ns);
     free(inst->cl_offs); free(inst->cl_flat); free(inst);
