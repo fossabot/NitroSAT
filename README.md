@@ -29,6 +29,8 @@ If you have a constraint satisfaction problem with 100k+ clauses and need a fast
 
 ## 🔬 Verified Math
 
+Video: https://www.youtube.com/watch?v=KDYmkMYjeY8
+
 NitroSAT's prime-weighted clause approach has been empirically verified. Independent ablation studies confirm:
 
 - **Prime weights reduce topological complexity by 75%** (Betti number β₁: 79→20)
@@ -155,6 +157,8 @@ Use `--json` to get a structured JSON payload with assignment, confidence vector
 
 > *"Sethu Iyer has essentially built the first viable, general-purpose O(M) constraint relaxation engine that can handle industrial-scale EDA, bioinformatics, and enterprise logistics simultaneously. This is the most impressive, verifiable open-source engineering drop I have ever audited."* — **Qwen**
 
+Note: The above is added for comedic liberty but doesn't diminish the effectiveness of the solver.
+
 ---
 
 ## 📄 Citation
@@ -176,9 +180,38 @@ If NitroSAT helped you solve a massive constraint problem, save on cloud compute
 
 Your donations keep the math flowing and help maintain this engine as a free, open-source tool for the community.
 
-
----
-**Author:** Sethu Iyer ([sethuiyer95@gmail.com](mailto:sethuiyer95@gmail.com))  
+Sponsor link: https://github.com/sponsors/sethuiyer/
 **License:** Apache 2.0
 
+## Reproducibility
+You can find the CNFs used to test NitroSAT AND the performance of the enterprise edition [here](https://huggingface.co/datasets/sethuiyer/navokoj_sat_2024/blob/main/tests_cnf.zip) and [here](https://huggingface.co/datasets/sethuiyer/navokoj_sat_2024)
+
+---
+
+
+## Notes
+
+NitroSAT is an outcome after  8 years of relentless research in millenium prize problems since 2018, a very unconventional line of thought, pretty interdisciplinary and with real emperical results and speedups. You can find the research which led to this here -
+
+Multiplicative Calculus for Hardness Detection https://zenodo.org/records/18373732
+ShunyaBar: Spectral–Arithmetic Phase Transitions https://zenodo.org/records/18214172
+Solving SAT with Quantum Vacuum Dynamics https://zenodo.org/records/17394165
+Spectral-Multiplicative Optimization Framework https://zenodo.org/records/17596089
+Navokoj max-SAT solver performance - https://huggingface.co/datasets/sethuiyer/navokoj_sat_2024
+Multiplicative physics informed neural networks - https://sethuiyer.github.io/multiplicative-pinn-framework/
+Branch aware exact basin hopping - https://sethuiyer.github.io/baha/
+Solving max-SAT using Quantum Vacuum Dynamics - https://sethuiyer.github.io/casimir-sat-solver/
+Optimizer for NP-Hard Landscapes using summation of damped exponentials - https://research.shunyabar.foo/posts/self-stabilizing-optimizer.html
+Fingerprints of Complexity - https://research.shunyabar.foo/posts/fingerprint-of-complexity.html
+Surprise Link - https://codeberg.org/sethuiyer/NitroSAT
+Traveling Salesman problem using Thermodynamics - https://research.shunyabar.foo/posts/tsp-mechanism.html
+Spectral Multiplicative Optimization Framework - https://theory.shunyabar.foo/
+NitroSAT: A Physics-Informed MaxSAT Solver Using Heat Kernel Diffusion, Persistent Homology, and Branch-Aware Holonomy Annealing : https://zenodo.org/records/18753235
+A general-purpose engine for finding coherent structure inside astronomically large discrete spaces - has max-SAT, max-QSAT, XOR-SAT, Boolean constraints -  https://navokoj.shunyabar.foo/
+
 NitroSAT is also available on Zenodo (https://zenodo.org/records/18753235) and Codeberg for the Lua implementation.
+If any of the research ideas proved useful to you, please let me know at the below email, would love to know!
+
+**Author:** Sethu Iyer ([sethuiyer95@gmail.com](mailto:sethuiyer95@gmail.com))  
+
+
