@@ -27,9 +27,17 @@ Unlike traditional solvers that stall on hard combinatorial bottlenecks, NitroSA
 
 If you have a constraint satisfaction problem with 100k+ clauses and need a fast approximate solution, try this. It won't guarantee 100% but it'll get you 99.5%+ in seconds.
 
-## 🔬 Verified Math
 
+## 🎨 How it Works
+
+NitroSAT maps the Boolean satisfiability problem to an energy landscape, using spectral initialization and Branch-Aware Holonomy Annealing (BAHA) to navigate complex basins.
+
+![NitroSAT Mechanism](img/howitworks.png)
+
+Website: https://primal-flow-solver.lovable.app/
 Video: https://www.youtube.com/watch?v=KDYmkMYjeY8
+
+## 🔬 Verified Math
 
 NitroSAT's prime-weighted clause approach has been empirically verified. Independent ablation studies confirm:
 
@@ -47,15 +55,6 @@ See [MATH.md](MATH.md#empirical-verification-2026-independent-audit) for the com
 - 🏢 **Enterprise Timetabling** - Solves **100 courses, 36 rooms, 41 slots (80,278,884 clauses)** in **5.2 hours** — 99.99999% satisfied
 - 🌐 **Graph Theory** - K-Clique, Coloring, Dominating Sets at 99.9%+ satisfaction
 - 📦 **Logistics & Scheduling** - Pigeonhole, Bin Packing, Shift Matching
-
-
-## 🎨 How it Works
-
-NitroSAT maps the Boolean satisfiability problem to an energy landscape, using spectral initialization and Branch-Aware Holonomy Annealing (BAHA) to navigate complex basins.
-
-![NitroSAT Mechanism](img/howitworks.png)
-
-Website: https://primal-flow-solver.lovable.app/
 
 ## 📊 Benchmarks & Scaling
 
@@ -187,6 +186,31 @@ Sponsor link: https://github.com/sponsors/sethuiyer/
 You can find the CNFs used to test NitroSAT AND the performance of the enterprise edition [here](https://huggingface.co/datasets/sethuiyer/navokoj_sat_2024/blob/main/tests_cnf.zip) and [here](https://huggingface.co/datasets/sethuiyer/navokoj_sat_2024)
 
 ---
+
+## Why Open Source
+
+NitroSAT is open source because the solver is the proof.
+
+The theory makes specific, falsifiable predictions:
+
+- Prime weights reduce topological complexity (Betti number β₁) by ~75%
+- Heat kernel diffusion detects phase transitions in constraint geometry
+- Satisfaction improves as constraint density increases — more structure, not less
+
+These aren't claims you can verify from a paper. You verify them by running the code.
+
+When NitroSAT solves an 80-million-clause instance and reports β₁ dropping from 44,983,725 to 6,701,177 over 5 hours, that's the theory executing in observable steps. Every topology snapshot, every phase transition signal, every prime weight ablation — visible, reproducible, falsifiable.
+
+A closed-source solver would make the mathematics unverifiable. Unverifiable mathematics isn't science — it's a claim.
+
+The empirical validation loop only closes if anyone can run:
+
+    gcc -O3 -march=native -std=c99 nitrosat.c -o nitrosat -lm
+
+and watch the theory behave exactly as predicted.
+
+That's why this is open source. Not as a business decision. As a scientific one.
+
 # Research Background
 
 NitroSAT is the outcome of 8 years of research into millennium prize problems, beginning in 2018. The work is unconventional, deeply interdisciplinary, and grounded in empirical results rather than theoretical claims alone.
@@ -225,5 +249,5 @@ The core ideas — multiplicative calculus, spectral phase transitions, quantum 
 
 If any of these ideas proved useful to you, I'd genuinely like to hear about it.
 
-**Author:** Sethu Iyer — sethuiyer95@gmail.com
+**Author:** Sethu Iyer(https://orcid.org/0009-0008-5446-2856) — shunyabarlabs@zohomail.com
 
