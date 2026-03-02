@@ -2656,7 +2656,7 @@ static int nitrosat_solve(NitroSat *ns)
        ----------------------------------------------------------------- */
     int sat = check_satisfaction(ns);
     if (sat == ns->num_clauses) {
-        printf("Freeing best_x in nitrosat_solve (early solve)... (sat: %d/%d)\n", sat, ns->num_clauses);
+        fprintf(stderr, "Freeing best_x in nitrosat_solve (early solve)... (sat: %d/%d)\n", sat, ns->num_clauses);
         free(best_x);
         return 1;
     }   /* already solved */
@@ -2719,9 +2719,13 @@ static int nitrosat_solve(NitroSat *ns)
         int bsat = check_satisfaction(ns);
         if (bsat > best_sat) {
             best_sat = bsat;
+            for (int i = 1; i <= ns->num_vars; ++i) best_x[i] = ns->x[i];
         }
     }
-    
+
+    /* Always restore best known assignment before returning */
+    for (int i = 1; i <= ns->num_vars; ++i) ns->x[i] = best_x[i];
+    recompute_sat_counts(ns);
     free(best_x);
     return (best_sat == ns->num_clauses);
 }
@@ -2740,6 +2744,7 @@ static int nitrosat_solve_dcw(NitroSat *ns, int num_passes)
         if (ns->verbose) printf("--- DCW PASS %d ---\n", pass);
         
         success = nitrosat_solve(ns);
+        recompute_sat_counts(ns);
         int sat_count = check_satisfaction(ns);
         
         if (sat_count > best_overall_sat) {
@@ -2807,6 +2812,7 @@ static void print_json_result(NitroSat *ns, const char *cnf_file,
                               SolverDiagnostics *diag,
                               const ProofReport *proof)
 {
+    recompute_sat_counts(ns);
     int final_sat = check_satisfaction(ns);
     int unsat = ns->num_clauses - final_sat;
     double sat_rate = (ns->num_clauses > 0) ? (double)final_sat / ns->num_clauses : 0.0;
@@ -2832,10 +2838,10 @@ static void print_json_result(NitroSat *ns, const char *cnf_file,
     print_json_escaped_string(cnf_file);
     printf(",\n");
 
-    /* Assignment in DIMACS format */
+    /* Assignment as 0/1 binary array (index = variable number - 1) */
     printf("  \"assignment\": [");
     for (int i = 1; i <= ns->num_vars; ++i) {
-        printf("%d", (ns->x[i] > 0.5) ? i : -i);
+        printf("%d", (ns->x[i] > 0.5) ? 1 : 0);
         if (i < ns->num_vars) printf(",");
     }
     printf("],\n");
@@ -3010,7 +3016,7 @@ static void compute_solver_diagnostics(NitroSat *ns, SolverDiagnostics *diag)
 int main(int argc, char **argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <cnf-file> [max-steps] [--no-dcw] [--no-topo] [--json] [--proof <path>] [--proof-format drat|lrat] [--proof-max-vars N] [--proof-max-clauses N]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <cnf-file> [max-steps] [--no-dcw] [--no-topo] [--cinematic] [--proof <path>] [--proof-format drat|lrat] [--proof-max-vars N] [--proof-max-clauses N]\n", argv[0]);
         fprintf(stderr, "Try %s --help for more information.\n", argv[0]);
         return EXIT_FAILURE;
     }
@@ -3028,7 +3034,7 @@ int main(int argc, char **argv)
         printf("Options:\n");
         printf("  --no-dcw                 Disable DCW heuristic (use standard random walk)\n");
         printf("  --no-topo                Disable topological/BAHA solver\n");
-        printf("  --json                   Output results in JSON format\n");
+        printf("  --cinematic              Output results in verbose text format (legacy)\n");
         printf("  --proof <path>          Generate DRAT proof on UNSAT (requires proof backend)\n");
         printf("  --proof-format drat|lrat  Proof format (default: drat)\n");
         printf("  --proof-max-vars N      Max variables for proof generation (default: 50000)\n");
@@ -3042,13 +3048,14 @@ int main(int argc, char **argv)
     int max_steps = 3000;
     int use_dcw = 1;
     int use_topo = 1;
-    int json_output = 0;
+    int json_output = 1;
     const char *proof_path = NULL;
     const char *proof_format = "drat";
 
     for (int i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "--no-dcw") == 0) use_dcw = 0;
         else if (strcmp(argv[i], "--no-topo") == 0) use_topo = 0;
+        else if (strcmp(argv[i], "--cinematic") == 0) json_output = 0;
         else if (strcmp(argv[i], "--json") == 0) json_output = 1;
         else if (strcmp(argv[i], "--proof") == 0) {
             if (i + 1 >= argc) {
