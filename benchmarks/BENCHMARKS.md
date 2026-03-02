@@ -408,3 +408,25 @@ Massive real-world scheduling: 100 courses, 36 rooms, 41 timeslots.
 **Test Scripts:** `test_cnfgen_full.py`, `test_leetcode_nightmare.py`, `test_ultra_nightmare.py`, `test_navokoj_api_fixed.py`
 
 **Documentation:** `CNFGEN.md`, `CNFGEN_RESULTS.md`, `LEETCODE_NIGHTMARE_RESULTS.md`, `NAVOKOJ_TEST_RESULTS.md`, `TESTING_SUMMARY.md`
+
+---
+
+### 1️⃣1️⃣ Pitfall Formula (CDCL Adversarial Trap)
+
+The **Pitfall formula** (Buss & Nordström) is specifically engineered to expose CDCL solvers' weakness. It has a seductive **"easy" part** that causes CDCL to commit via unit propagation and fall into an exponentially hard Tseitin sub-problem, provably requiring exponential resolution.
+
+NitroSAT's continuous relaxation never "commits" to a branch — it is therefore **structurally immune** to the pitfall trap.
+
+| Instance | Parameters | Variables | Clauses | Satisfaction | Time | Topology (β₁) |
+|----------|-----------|-----------|---------|-------------|------|---------------|
+| `pit.cnf` | `pitfall 45 4 30 5 8` | 1,784 | 361,095 | **99.998%** (7 unsat) | 383.55s | 1,575 → 18,996 |
+
+**Key Observations:**
+- Only **7 clauses unsatisfied** out of 361,095 — all in the hard Tseitin core (theoretically requires extended resolution)
+- **β₁ increased** 1,575 → 18,996: the solver orbits the hard core, tightening the topological knot, but never collapses into the pitfall
+- The unit-propagation trap never triggers because there is no discrete branch commitment
+
+```bash
+cnfgen pitfall 45 4 30 5 8 > pit.cnf
+./nitrosat pit.cnf --cinematic
+```
