@@ -1835,8 +1835,8 @@ static int baha_walksat(NitroSat *ns, int max_flips)
     const double BAHA_BETA_START = 0.01;
     const double BAHA_BETA_END = 10.0;
     const double BAHA_FRACTURE_THRESHOLD = 1.5;
-    const int BAHA_SAMPLES_PER_BETA = 50;
-    const int BAHA_BRANCH_JUMP_INTERVAL = 200;  /* Match beta_steps = 200 in benchmark */
+    const int BAHA_SAMPLES_PER_BETA = (ns->num_vars > 10000) ? 5 : 50;
+    const int BAHA_BRANCH_JUMP_INTERVAL = (ns->num_vars > 10000) ? (ns->num_vars / 50) : 200;
     
     int m = ns->num_clauses;
     recompute_sat_counts(ns);
@@ -2661,7 +2661,10 @@ static int nitrosat_solve(NitroSat *ns)
         for (int i = 1; i <= ns->num_vars; ++i) ns->x[i] = best_x[i] > 0.5 ? 1.0 : 0.0;
         
         /* Run BAHA-WalkSAT with baha.cpp params: 200 steps × 50 samples */
-        baha_walksat(ns, ns->num_vars * 200);
+        /* Max flips capped to 2M for massive instances to prevent hangs */
+        int max_sc_flips = ns->num_vars * 200;
+        if (max_sc_flips > 2000000) max_sc_flips = 2000000;
+        baha_walksat(ns, max_sc_flips);
         int bsat = check_satisfaction(ns);
         if (bsat > best_sat) {
             best_sat = bsat;
