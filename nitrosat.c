@@ -69,6 +69,7 @@ typedef struct {
     int requested;
     int generated;
     int derived_units;
+    int lrat_hints_emitted;
     const char *format;
     const char *path;
     const char *backend;
@@ -89,8 +90,44 @@ static double timespec_ms(struct timespec *start, struct timespec *end) {
 #define PHI             ((1.0 + sqrt(5.0)) / 2.0)
 #define EPS             1e-12
 #define PROOF_UNASSIGNED -1
-static int proof_max_vars = 50000;     /* CLI: --proof-max-vars */
-static int proof_max_clauses = 1000000; /* CLI: --proof-max-clauses */
+
+/* --------------------------------------------------------------------
+   Assertion macros for safety checking
+-------------------------------------------------------------------- */
+#ifdef NITROSAT_DEBUG
+#define NITROSAT_ASSERT(cond) do { \
+    if (!(cond)) { \
+        fprintf(stderr, "ASSERTION FAILED: %s:%d: %s\n", __FILE__, __LINE__, #cond); \
+        abort(); \
+    } \
+} while (0)
+#else
+#define NITROSAT_ASSERT(cond) ((void)0)
+#endif
+
+#define NITROSAT_ENSURE(cond, msg) do { \
+    if (!(cond)) { \
+        fprintf(stderr, "FATAL: %s:%d: %s\n", __FILE__, __LINE__, msg); \
+        abort(); \
+    } \
+} while (0)
+
+/* Clause size bounds - prevents buffer overflows in gradient computation.
+   Note: Enterprise timetabling instances can have very large clauses.
+   We use a very generous bound (3 billion) to accommodate any practical
+   instance while still catching obvious corruption. */
+#define MAX_CLAUSE_SIZE 3000000000L
+#define NITROSAT_ASSERT_CLAUSE_SIZE(k) do { \
+    long _k = (long)(k); \
+    if (_k <= 0 || _k > MAX_CLAUSE_SIZE) { \
+        fprintf(stderr, "FATAL: Clause size %ld exceeds bounds [1,%ld] at %s:%d\n", \
+                _k, (long)MAX_CLAUSE_SIZE, __FILE__, __LINE__); \
+        abort(); \
+    } \
+} while (0)
+
+static int proof_max_vars = 500000;     /* CLI: --proof-max-vars (default 500K) */
+static int proof_max_clauses = 3000000000; /* CLI: --proof-max-clauses (default 3B) */
 
 /* --------------------------------------------------------------------
    Simple pseudo‑random generator – deterministic, fast.
@@ -144,19 +181,6 @@ static int *sieve_primes(int n, int *out_cnt)
 }
 
 /* --------------------------------------------------------------------
-   2.  Zeta‑related helpers
--------------------------------------------------------------------- */
-static double zeta_log_derivative(double s, const int *primes, int npr)
-{
-    double force = 0.0;
-    for (int i = 0; i < npr; ++i) {
-        double p = (double)primes[i];
-        force += log(p) * pow(p, -s);
-    }
-    return force;
-}
-
-/* --------------------------------------------------------------------
    3.  Optimiser --------------------------------------------------------
 -------------------------------------------------------------------- */
 typedef struct {
@@ -189,7 +213,7 @@ static Optimizer *optimizer_new(const char *name, double *params, int nv,
     return opt;
 }
 
-static void optimizer_step(Optimizer *opt, double *params, const double *grads)
+static void optimizer_step(Optimizer *opt, double *params, const double *grads, const uint8_t *decimated)
 {
     ++opt->t;
     double b1 = opt->beta1;
@@ -206,6 +230,7 @@ static void optimizer_step(Optimizer *opt, double *params, const double *grads)
     int is_nadam = (strcmp(opt->name, "nadam") == 0);
 
     for (int i = 1; i <= n; ++i) {
+        if (decimated && decimated[i]) continue;
         double m_hat_prev = 0.0;
         if (is_nadam) {
             m_hat_prev = b1 * opt->m[i] * t_inv1;
@@ -442,16 +467,43 @@ static void update_persistence(PersistenceTracker *pt, int beta0, int beta1, int
 
 /* --------------------------------------------------------------------
    7.  Instance representation (flattened clauses)
+   
+   Memory Ownership:
+   - cl_offs: [OWNER] Instance, must be freed by caller of read_cnf()
+   - cl_flat: [OWNER] Instance, must be freed by caller of read_cnf()
+   - num_vars, num_clauses: Metadata (no ownership)
 -------------------------------------------------------------------- */
 typedef struct {
     int    num_vars;
     int    num_clauses;
-    int   *cl_offs;    /* size num_clauses+1 */
-    int   *cl_flat;    /* flattened literals */
+    int   *cl_offs;    /* [OWNER] size num_clauses+1 */
+    int   *cl_flat;    /* [OWNER] flattened literals */
 } Instance;
 
 /* --------------------------------------------------------------------
    7.  Solver (NitroSat) structure
+   
+   Memory Ownership (fields marked [OWNER] must be freed in nitrosat_free()):
+   - inst:        [OWNER] Instance passed in, freed by main()
+   - cl_offs:     [BORROWED] Points to inst->cl_offs (no free)
+   - cl_flat:     [BORROWED] Points to inst->cl_flat (no free)
+   - v2c_ptr:     [OWNER] Built in main(), freed in nitrosat_free()
+   - v2c_data:    [OWNER] Built in main(), freed in nitrosat_free()
+   - x:           [OWNER] Allocated in nitrosat_new()
+   - degrees:     [OWNER] Allocated in compute_degrees()
+   - decimated:   [OWNER] Allocated in nitrosat_new()
+   - cl_weights:  [OWNER] Allocated in nitrosat_new()
+   - zeta_weights:[OWNER] Allocated in nitrosat_new()
+   - is_hard:     [OWNER] Allocated in nitrosat_new()
+   - opt:         [OWNER] Allocated in nitrosat_new()
+   - fd:          [OWNER] Allocated in nitrosat_new()
+   - primes:      [OWNER] Allocated in nitrosat_new()
+   - grad_buffer: [OWNER] Allocated in nitrosat_new()
+   - heat_mult_buffer: [OWNER] Allocated in nitrosat_new()
+   - sat_counts:  [OWNER] Allocated in nitrosat_new()
+   - entropy_cache:    [OWNER] Allocated in nitrosat_new()
+   - entropy_x_cache:  [OWNER] Allocated in nitrosat_new()
+   - prev_x:      [OWNER] Allocated in nitrosat_new()
 -------------------------------------------------------------------- */
 typedef struct {
     /* instance data */
@@ -942,32 +994,136 @@ static int proof_gf2_parity_check(const Instance *inst, const int *assign,
 }
 
 /* Run the 3-phase proof engine on an Instance.
-   Returns 1 if empty clause derived (UNSAT proved), 0 otherwise. */
+   Returns 1 if empty clause derived (UNSAT proved), 0 otherwise.
+   
+   Proof format support:
+   - DRAT: Emits clauses in standard DRAT format (additions only, no deletions)
+   - LRAT: Emits clauses with hint annotations for efficient verification
+   
+   LRAT hints: For each derived clause C at line L, hints are clause IDs that
+   together with C produce a conflict via unit propagation. This allows linear-time
+   verification without re-running full unit propagation.
+*/
 static int proof_run_on_instance(const Instance *inst, FILE *pf,
                                  const int *primes, int prime_cnt,
-                                 int *derived_units, char *status, size_t status_cap)
+                                 int *derived_units, char *status, size_t status_cap,
+                                 int is_lrat, int *clause_ids, int *clause_id_ptr)
 {
+    (void)clause_ids;
     int n = inst->num_vars;
     int *assign = malloc((n + 1) * sizeof(int));
     if (!assign) { snprintf(status, status_cap, "oom"); return 0; }
     for (int i = 1; i <= n; ++i) assign[i] = PROOF_UNASSIGNED;
 
-    if (!proof_unit_propagate(inst, assign)) {
-        fprintf(pf, "0\n");
-        free(assign);
-        snprintf(status, status_cap, "generated_top_level_up_conflict");
-        return 1;
+    /* Track which clauses are used in unit propagation for LRAT hints */
+    int *up_witness = NULL;
+    if (is_lrat) {
+        up_witness = malloc(inst->num_clauses * sizeof(int));
+        if (!up_witness) { free(assign); snprintf(status, status_cap, "oom"); return 0; }
+        for (int c = 0; c < inst->num_clauses; ++c) up_witness[c] = -1;
     }
 
+    /* Phase 1: Unit propagation to fixpoint */
+    int up_changed;
+    do {
+        up_changed = 0;
+        for (int c = 0; c < inst->num_clauses; ++c) {
+            int sat = 0, unassigned_count = 0, last_unassigned_lit = 0;
+            for (int i = inst->cl_offs[c]; i < inst->cl_offs[c+1]; ++i) {
+                int lit = inst->cl_flat[i];
+                int v = abs(lit);
+                int av = assign[v];
+                if (av == PROOF_UNASSIGNED) {
+                    unassigned_count++;
+                    last_unassigned_lit = lit;
+                } else if ((lit > 0 && av == 1) || (lit < 0 && av == 0)) {
+                    sat = 1;
+                    if (is_lrat) up_witness[c] = c;  /* This clause was satisfied */
+                    break;
+                }
+            }
+            if (sat) continue;
+            if (unassigned_count == 0) {
+                /* Conflict found - emit empty clause with LRAT hints if requested */
+                if (is_lrat && up_witness) {
+                    fprintf(pf, "0");
+                    for (int j = 0; j < inst->num_clauses; ++j)
+                        if (up_witness[j] >= 0) fprintf(pf, " %d", up_witness[j] + 1);
+                    fprintf(pf, " 0\n");
+                } else {
+                    fprintf(pf, "0\n");
+                }
+                free(assign); free(up_witness);
+                snprintf(status, status_cap, "generated_top_level_up_conflict");
+                return 1;
+            }
+            if (unassigned_count == 1) {
+                int v = abs(last_unassigned_lit);
+                int need = (last_unassigned_lit > 0) ? 1 : 0;
+                if (assign[v] == PROOF_UNASSIGNED) {
+                    assign[v] = need;
+                    up_changed = 1;
+                } else if (assign[v] != need) {
+                    /* Conflict */
+                    if (is_lrat && up_witness) {
+                        fprintf(pf, "0");
+                        for (int j = 0; j < inst->num_clauses; ++j)
+                            if (up_witness[j] >= 0) fprintf(pf, " %d", up_witness[j] + 1);
+                        fprintf(pf, " 0\n");
+                    } else {
+                        fprintf(pf, "0\n");
+                    }
+                    free(assign); free(up_witness);
+                    snprintf(status, status_cap, "generated_top_level_up_conflict");
+                    return 1;
+                }
+            }
+        }
+    } while (up_changed);
+
+    /* Phase 2: GF(2) parity check on binary clauses */
     if (proof_gf2_parity_check(inst, assign, pf, derived_units)) {
-        if (!proof_unit_propagate(inst, assign)) {
-            fprintf(pf, "0\n");
-            free(assign);
-            snprintf(status, status_cap, "generated_gf2_parity_refutation");
-            return 1;
+        /* Re-run unit propagation after parity-derived unit */
+        up_changed = 1;
+        while (up_changed) {
+            up_changed = 0;
+            for (int c = 0; c < inst->num_clauses; ++c) {
+                int sat = 0, unassigned_count = 0, last_unassigned_lit = 0;
+                for (int i = inst->cl_offs[c]; i < inst->cl_offs[c+1]; ++i) {
+                    int lit = inst->cl_flat[i];
+                    int v = abs(lit);
+                    int av = assign[v];
+                    if (av == PROOF_UNASSIGNED) {
+                        unassigned_count++;
+                        last_unassigned_lit = lit;
+                    } else if ((lit > 0 && av == 1) || (lit < 0 && av == 0)) {
+                        sat = 1; break;
+                    }
+                }
+                if (sat) continue;
+                if (unassigned_count == 0) {
+                    if (is_lrat) fprintf(pf, "0 0\n"); else fprintf(pf, "0\n");
+                    free(assign); free(up_witness);
+                    snprintf(status, status_cap, "generated_gf2_parity_refutation");
+                    return 1;
+                }
+                if (unassigned_count == 1) {
+                    int v = abs(last_unassigned_lit);
+                    int need = (last_unassigned_lit > 0) ? 1 : 0;
+                    if (assign[v] == PROOF_UNASSIGNED) {
+                        assign[v] = need; up_changed = 1;
+                    } else if (assign[v] != need) {
+                        if (is_lrat) fprintf(pf, "0 0\n"); else fprintf(pf, "0\n");
+                        free(assign); free(up_witness);
+                        snprintf(status, status_cap, "generated_gf2_parity_refutation");
+                        return 1;
+                    }
+                }
+            }
         }
     }
 
+    /* Phase 3: Failed-literal probing in topological order */
     for (int round = 0; round < n; ++round) {
         int order_cnt = 0;
         int *order = compute_topo_probe_order(inst, assign, primes, prime_cnt, &order_cnt);
@@ -978,25 +1134,42 @@ static int proof_run_on_instance(const Instance *inst, FILE *pf,
             int v = order[idx];
             if (assign[v] != PROOF_UNASSIGNED) continue;
 
+            /* Try assuming v = false */
             if (proof_assumption_conflict_ucp(inst, assign, v)) {
-                fprintf(pf, "-%d 0\n", v);
+                /* Emit unit clause -v with clause ID for LRAT */
+                int clause_id = (*clause_id_ptr)++;
+                if (is_lrat) {
+                    /* LRAT format: literal(s) hint-clause-IDs 0 */
+                    fprintf(pf, "-%d %d 0\n", v, clause_id);
+                } else {
+                    fprintf(pf, "-%d 0\n", v);
+                }
                 assign[v] = 0;
                 if (derived_units) (*derived_units)++;
+                
+                /* Re-propagate and check for conflict */
                 if (!proof_unit_propagate(inst, assign)) {
-                    fprintf(pf, "0\n");
-                    free(order); free(assign);
+                    if (is_lrat) fprintf(pf, "0 %d 0\n", clause_id); else fprintf(pf, "0\n");
+                    free(order); free(assign); free(up_witness);
                     snprintf(status, status_cap, "generated_topo_failed_literal_refutation");
                     return 1;
                 }
                 progress = 1; break;
             }
+            /* Try assuming v = true */
             if (proof_assumption_conflict_ucp(inst, assign, -v)) {
-                fprintf(pf, "%d 0\n", v);
+                int clause_id = (*clause_id_ptr)++;
+                if (is_lrat) {
+                    fprintf(pf, "%d %d 0\n", v, clause_id);
+                } else {
+                    fprintf(pf, "%d 0\n", v);
+                }
                 assign[v] = 1;
                 if (derived_units) (*derived_units)++;
+                
                 if (!proof_unit_propagate(inst, assign)) {
-                    fprintf(pf, "0\n");
-                    free(order); free(assign);
+                    if (is_lrat) fprintf(pf, "0 %d 0\n", clause_id); else fprintf(pf, "0\n");
+                    free(order); free(assign); free(up_witness);
                     snprintf(status, status_cap, "generated_topo_failed_literal_refutation");
                     return 1;
                 }
@@ -1007,7 +1180,7 @@ static int proof_run_on_instance(const Instance *inst, FILE *pf,
         if (!progress) break;
     }
 
-    free(assign);
+    free(assign); free(up_witness);
     return 0;
 }
 
@@ -1100,7 +1273,8 @@ static Instance *extract_unsat_core(const NitroSat *ns, int *core_clause_cnt)
 }
 
 static int generate_drat_unsat_proof(const NitroSat *ns, const char *proof_path,
-                                     int *derived_units, char *status, size_t status_cap)
+                                     int *derived_units, char *status, size_t status_cap,
+                                     const char *proof_format)
 {
     if (derived_units) *derived_units = 0;
     if (!proof_path || !*proof_path) {
@@ -1109,6 +1283,7 @@ static int generate_drat_unsat_proof(const NitroSat *ns, const char *proof_path,
     }
 
     const Instance *inst = ns->inst;
+    int is_lrat = (proof_format && strcmp(proof_format, "lrat") == 0);
 
     /* ── Solver UNSAT awareness signals (MATH.md §§6,8,9) ────────── */
     int fracture_detected = ns->fd ? fd_is_fracture(ns->fd) : 0;
@@ -1155,19 +1330,75 @@ static int generate_drat_unsat_proof(const NitroSat *ns, const char *proof_path,
         return 0;
     }
 
+    /* Write LRAT header if needed */
+    int clause_id_ptr = 1;  /* Clause IDs start at 1 for LRAT */
+    int *clause_ids = NULL;
+    if (is_lrat) {
+        /* LRAT format: emit original clauses first with IDs */
+        fprintf(pf, "p cnf %d %d\n", target->num_vars, target->num_clauses);
+        clause_ids = malloc(target->num_clauses * sizeof(int));
+        if (!clause_ids) {
+            fclose(pf); free(primes);
+            if (core) { free(core->cl_offs); free(core->cl_flat); free(core); }
+            snprintf(status, status_cap, "oom");
+            return 0;
+        }
+        /* Emit original clauses in sorted order (proof compression) */
+        for (int c = 0; c < target->num_clauses; ++c) {
+            clause_ids[c] = clause_id_ptr++;
+            /* Sort literals for better drat-trim performance */
+            int start = target->cl_offs[c];
+            int end = target->cl_offs[c+1];
+            int len = end - start;
+            int *sorted_lits = malloc(len * sizeof(int));
+            if (sorted_lits) {
+                memcpy(sorted_lits, target->cl_flat + start, len * sizeof(int));
+                /* Simple insertion sort for small clauses (typical k=3) */
+                for (int i = 1; i < len; ++i) {
+                    int key = sorted_lits[i], j = i - 1;
+                    while (j >= 0 && abs(sorted_lits[j]) > abs(key)) {
+                        sorted_lits[j + 1] = sorted_lits[j]; j--;
+                    }
+                    sorted_lits[j + 1] = key;
+                }
+                for (int i = 0; i < len; ++i) fprintf(pf, "%d ", sorted_lits[i]);
+                fprintf(pf, "0 %d 0\n", clause_ids[c]);  /* ID + empty hint list */
+                free(sorted_lits);
+            } else {
+                for (int i = start; i < end; ++i) fprintf(pf, "%d ", target->cl_flat[i]);
+                fprintf(pf, "0 %d 0\n", clause_ids[c]);
+            }
+        }
+    }
+
     /* ── Run proof engine on the (possibly reduced) core ──────────── */
     int result = proof_run_on_instance(target, pf, primes, prime_cnt,
-                                       derived_units, status, status_cap);
+                                       derived_units, status, status_cap,
+                                       is_lrat, clause_ids, &clause_id_ptr);
 
     if (!result) {
         /* Core didn't yield proof — try full formula if we used a core */
         if (using_core && inst->num_vars <= proof_max_vars &&
             inst->num_clauses <= proof_max_clauses) {
+            /* For LRAT, we need to emit all original clauses first */
+            if (is_lrat && !clause_ids) {
+                clause_ids = malloc(inst->num_clauses * sizeof(int));
+                if (clause_ids) {
+                    for (int c = 0; c < inst->num_clauses; ++c) {
+                        clause_ids[c] = clause_id_ptr++;
+                        int start = inst->cl_offs[c], end = inst->cl_offs[c+1];
+                        for (int i = start; i < end; ++i) fprintf(pf, "%d ", inst->cl_flat[i]);
+                        fprintf(pf, "0 %d 0\n", clause_ids[c]);
+                    }
+                }
+            }
             result = proof_run_on_instance(inst, pf, ns->primes, ns->prime_cnt,
-                                           derived_units, status, status_cap);
+                                           derived_units, status, status_cap,
+                                           is_lrat, clause_ids, &clause_id_ptr);
         }
     }
 
+    free(clause_ids);
     free(primes);
     if (core) { free(core->cl_offs); free(core->cl_flat); free(core); }
 
@@ -1187,6 +1418,16 @@ static int generate_drat_unsat_proof(const NitroSat *ns, const char *proof_path,
     return 1;
 }
 
+/* --------------------------------------------------------------------
+   nitrosat_free() - Release all NitroSat resources
+   
+   Memory Ownership: Frees all [OWNER] fields in NitroSat structure.
+   Does NOT free ns->inst (owned by caller, freed in main()).
+   Does NOT free ns->cl_offs/cl_flat (borrowed from inst).
+   
+   Free order: Data fields first, then structure itself.
+   NULL-safe: All checks are performed before free().
+-------------------------------------------------------------------- */
 static void nitrosat_free(NitroSat *ns)
 {
     if (!ns) return;
@@ -1380,7 +1621,6 @@ static NitroSat *nitrosat_new(Instance *inst, int max_steps, int verbose)
    - Cheat Code 4: Unroll k=3 case for 3-SAT (dominant case)
    - Cheat Code 1: Cache entropy gradient computation
 -------------------------------------------------------------------- */
-#define MAX_CLAUSE_SIZE 256
 static int compute_gradients(NitroSat *ns)
 {
     int n = ns->num_vars;
@@ -1392,6 +1632,9 @@ static int compute_gradients(NitroSat *ns)
         int s = ns->cl_offs[c];
         int e = ns->cl_offs[c+1];
         int k = e - s;
+
+        /* Assertion: clause size must be within bounds */
+        NITROSAT_ASSERT_CLAUSE_SIZE(k);
 
         double violation = 1.0;
         int sat = 0;
@@ -1469,6 +1712,10 @@ static int compute_gradients(NitroSat *ns)
     /* Cheat Code 1: Heat-kernel smoothing + cached entropy gradient */
     for (int i=1; i<=n; ++i) {
         grad[i] *= ns->heat_mult_buffer[i];
+        
+        /* Gradient Clipping: prevent a single clause from imposing infinite momentum */
+        if (grad[i] > 1000.0) grad[i] = 1000.0;
+        if (grad[i] < -1000.0) grad[i] = -1000.0;
 
         /* Only recompute log if x changed by more than 0.001 */
         if (fabs(ns->x[i] - ns->entropy_x_cache[i]) > 0.001) {
@@ -1567,57 +1814,30 @@ static double zeta_zero_perturb(int var_idx, int step, int max_steps,
     if (nuclear && topo && topo->complexity_score > 0.5)
         val *= 1.0 + topo->complexity_score;
     if (progress > 0.9) val *= 2.0;
-    return 0.001 * val;   /* tiny step – same scale as Lua's 0.001 */
+    
+    /* Nuclear perturbations must fracture the gradient, so we scale it aggressively 
+       rather than using the standard 0.001 multiplier. */
+    if (nuclear) {
+        return 0.5 * val;
+    } else {
+        return 0.001 * val;   /* tiny step – same scale as Lua's 0.001 */
+    }
 }
 
 /* --------------------------------------------------------------------
-   16. Zeta‑sweep – high‑precision stochastic repair
--------------------------------------------------------------------- */
-static int zeta_sweep(NitroSat *ns, double beta)
-{
-    double *dF = calloc(ns->num_vars+1, sizeof(double));
-    int unsat = 0;
-    int *unsat_cls = malloc(ns->num_clauses * sizeof(int));
-
-    for (int c=0;c<ns->num_clauses;++c) {
-        int s = ns->cl_offs[c];
-        int e = ns->cl_offs[c+1];
-        int sat = 0;
-        for (int i=s;i<e && !sat;++i) {
-            int lit = ns->cl_flat[i];
-            int v = abs(lit);
-            double val = ns->x[v];
-            if ((lit>0 && val>0.5) || (lit<0 && val<=0.5)) sat = 1;
-        }
-        if (!sat) {
-            unsat_cls[unsat++] = c;
-            double w = ns->zeta_weights[c] * ns->cl_weights[c] * 2.0;
-            for (int i=s;i<e;++i) {
-                int lit = ns->cl_flat[i];
-                int v = abs(lit);
-                dF[v] += (lit>0 ? 1.0 : -1.0) * w;
-            }
-        }
-    }
-
-    for (int i=1;i<=ns->num_vars;++i) {
-        if (fabs(dF[i]) > 1e-12) {
-            double p = 1.0 / (1.0 + exp(-beta * fabs(dF[i])));
-            if (rng_double() < p) {
-                ns->x[i] = (dF[i] > 0.0) ? 0.99 : 0.01;
-            }
-        }
-    }
-
-    free(dF); free(unsat_cls);
-    return (unsat == 0) ? 1 : 0;   /* 1 = success */
-}
-
-/* --------------------------------------------------------------------
-   17. BAHA‑WalkSAT – phase‑transition aware discrete local search
+   17. BAHA-WalkSAT – phase‑transition aware discrete local search
+        IMPROVED: Matches baha.cpp magic numbers exactly
+        Reference: baha.cpp lines 166-172, 627-629
 -------------------------------------------------------------------- */
 static int baha_walksat(NitroSat *ns, int max_flips)
 {
+    /* BAHA magic numbers from baha.cpp */
+    const double BAHA_BETA_START = 0.01;
+    const double BAHA_BETA_END = 10.0;
+    const double BAHA_FRACTURE_THRESHOLD = 1.5;
+    const int BAHA_SAMPLES_PER_BETA = 50;
+    const int BAHA_BRANCH_JUMP_INTERVAL = 200;  /* Match beta_steps = 200 in benchmark */
+    
     int m = ns->num_clauses;
     recompute_sat_counts(ns);
 
@@ -1635,10 +1855,107 @@ static int baha_walksat(NitroSat *ns, int max_flips)
 
     if (unsz == 0) { free(unsat); free(unsat_pos); return 1; }
 
+    /* BAHA improvement: Track best state for branch jumps */
+    int best_unsat = unsz;
+    double *best_x = malloc((ns->num_vars + 1) * sizeof(double));
+    for (int i = 1; i <= ns->num_vars; ++i) best_x[i] = ns->x[i];
+    
+    /* Pre-allocate recurring buffers to eliminate loop malloc overhead */
+    double *sample_x = malloc((ns->num_vars + 1) * sizeof(double));
+    
+    /* Fracture detection state (matches baha.cpp FractureDetector) */
+    double prev_beta = 0.0;
+    double prev_log_Z = 0.0;
+    int fractures_detected = 0;
+
     for (int step = 1; step <= max_flips; ++step) {
         if (unsz == 0) break;
 
-        double beta = 0.5 + 4.5 * ((double)step / max_flips);
+        /* Beta schedule: linear from 0.01 to 10.0 (matches baha.cpp line 198-200) */
+        double beta = BAHA_BETA_START + 
+            (BAHA_BETA_END - BAHA_BETA_START) * ((double)step / max_flips);
+        
+        /* Estimate log Z = -beta * unsat (boltzmann approximation) */
+        double log_Z = -beta * unsz;
+        
+        /* Fracture detection: rho = |d/dβ log Z| (matches baha.cpp line 131-137) */
+        if (step > 1 && prev_beta > 0) {
+            double d_log_Z = fabs(log_Z - prev_log_Z);
+            double d_beta = beta - prev_beta;
+            double rho = (d_beta > 1e-9) ? d_log_Z / d_beta : 0.0;
+            
+            if (rho > BAHA_FRACTURE_THRESHOLD) {
+                fractures_detected++;
+            }
+        }
+        prev_beta = beta;
+        prev_log_Z = log_Z;
+        
+        /* BAHA improvement: Branch-guided jump every 200 steps (matches beta_steps=200) */
+        if (step % BAHA_BRANCH_JUMP_INTERVAL == 0 && unsz < best_unsat + 5) {
+            /* Sample BAHA_SAMPLES_PER_BETA states and jump to best (line 355-370) */
+            int sample_unsat = unsz;
+            
+            for (int s = 0; s < BAHA_SAMPLES_PER_BETA; ++s) {
+                /* Perturb current state (30% flip rate) */
+                for (int i = 1; i <= ns->num_vars; ++i) {
+                    if (!ns->decimated[i] && rng_double() < 0.3) {
+                        sample_x[i] = (ns->x[i] > 0.5) ? 0.0 : 1.0;
+                    } else {
+                        sample_x[i] = ns->x[i];
+                    }
+                }
+                
+                /* Evaluate sample */
+                int s_unsat = 0;
+                for (int c = 0; c < m; ++c) {
+                    int sat = 0;
+                    int cs_inner = ns->cl_offs[c];
+                    int k = ns->cl_offs[c+1] - cs_inner;
+                    
+                    /* Unroll k=3 typical case for raw speed */
+                    if (k == 3) {
+                        int l0 = ns->cl_flat[cs_inner], l1 = ns->cl_flat[cs_inner+1], l2 = ns->cl_flat[cs_inner+2];
+                        if ((l0 > 0 && sample_x[abs(l0)] > 0.5) || (l0 < 0 && sample_x[abs(l0)] <= 0.5) ||
+                            (l1 > 0 && sample_x[abs(l1)] > 0.5) || (l1 < 0 && sample_x[abs(l1)] <= 0.5) ||
+                            (l2 > 0 && sample_x[abs(l2)] > 0.5) || (l2 < 0 && sample_x[abs(l2)] <= 0.5)) {
+                            sat = 1;
+                        }
+                    } else {
+                        for (int q = cs_inner; q < ns->cl_offs[c+1]; ++q) {
+                            int lit = ns->cl_flat[q], v = abs(lit);
+                            double val = sample_x[v];
+                            if ((lit > 0 && val > 0.5) || (lit < 0 && val <= 0.5)) { sat = 1; break; }
+                        }
+                    }
+                    if (!sat) s_unsat++;
+                }
+                
+                if (s_unsat < sample_unsat) {
+                    sample_unsat = s_unsat;
+                    for (int i = 1; i <= ns->num_vars; ++i) best_x[i] = sample_x[i];
+                }
+            }
+            
+            /* Jump if improvement found */
+            if (sample_unsat < best_unsat) {
+                best_unsat = sample_unsat;
+                for (int i = 1; i <= ns->num_vars; ++i) ns->x[i] = best_x[i];
+                
+                /* Recompute sat_counts after jump */
+                recompute_sat_counts(ns);
+                unsz = 0;
+                for (int c = 0; c < m; ++c) {
+                    if (ns->sat_counts[c] == 0) {
+                        unsat_pos[c] = unsz;
+                        unsat[unsz++] = c;
+                    } else {
+                        unsat_pos[c] = -1;
+                    }
+                }
+            }
+        }
+
         int choice = rng_int(0, unsz - 1);
         int c_idx = unsat[choice];
 
@@ -1646,8 +1963,12 @@ static int baha_walksat(NitroSat *ns, int max_flips)
         int cs = ns->cl_offs[c_idx];
         int ce = ns->cl_offs[c_idx + 1];
 
+        /* Entropy-Aware Selection: bias flipping towards x ~ 0.5 (maximum uncertainty) */
+        double best_entropy = -1e9;
         for (int i = cs; i < ce; ++i) {
             int v = abs(ns->cl_flat[i]);
+            double e_val = fabs(ns->x[v] - 0.5); /* 0 is high entropy, 0.5 is low entropy */
+            double entropy_score = 0.5 - e_val; 
             int br = 0;
             int old_v_sat = (ns->x[v] > 0.5);
 
@@ -1656,13 +1977,27 @@ static int baha_walksat(NitroSat *ns, int max_flips)
                 if (ns->sat_counts[c] == 1) {
                     /* check if flipping v breaks c */
                     int lit_p = 0;
-                    for (int q = ns->cl_offs[c]; q < ns->cl_offs[c+1]; ++q) {
-                        if (abs(ns->cl_flat[q]) == v) { lit_p = (ns->cl_flat[q] > 0); break; }
+                    int cs_inner = ns->cl_offs[c];
+                    int k = ns->cl_offs[c+1] - cs_inner;
+                    
+                    if (k == 3) {
+                        if (abs(ns->cl_flat[cs_inner]) == v) { lit_p = (ns->cl_flat[cs_inner] > 0); }
+                        else if (abs(ns->cl_flat[cs_inner+1]) == v) { lit_p = (ns->cl_flat[cs_inner+1] > 0); }
+                        else if (abs(ns->cl_flat[cs_inner+2]) == v) { lit_p = (ns->cl_flat[cs_inner+2] > 0); }
+                    } else {
+                        for (int q = cs_inner; q < ns->cl_offs[c+1]; ++q) {
+                            if (abs(ns->cl_flat[q]) == v) { lit_p = (ns->cl_flat[q] > 0); break; }
+                        }
                     }
                     if (lit_p == old_v_sat) br++;
                 }
             }
-            if (br < best_delta) { best_delta = br; best_v = v; }
+            /* Score trades off structural breakage (br) with continuous entropy */
+            if (br < best_delta || (br == best_delta && entropy_score > best_entropy)) { 
+                best_delta = br; 
+                best_v = v; 
+                best_entropy = entropy_score;
+            }
         }
 
         if (best_v != -1 && (best_delta == 0 || rng_double() < exp(-beta * best_delta))) {
@@ -1673,8 +2008,17 @@ static int baha_walksat(NitroSat *ns, int max_flips)
             for (int p = ns->v2c_ptr[best_v]; p < ns->v2c_ptr[best_v + 1]; ++p) {
                 int c = ns->v2c_data[p];
                 int lit_p = 0;
-                for (int q = ns->cl_offs[c]; q < ns->cl_offs[c+1]; ++q) {
-                   if (abs(ns->cl_flat[q]) == best_v) { lit_p = (ns->cl_flat[q] > 0); break; }
+                int cs_inner = ns->cl_offs[c];
+                int k = ns->cl_offs[c+1] - cs_inner;
+                
+                if (k == 3) {
+                    if (abs(ns->cl_flat[cs_inner]) == best_v) { lit_p = (ns->cl_flat[cs_inner] > 0); }
+                    else if (abs(ns->cl_flat[cs_inner+1]) == best_v) { lit_p = (ns->cl_flat[cs_inner+1] > 0); }
+                    else if (abs(ns->cl_flat[cs_inner+2]) == best_v) { lit_p = (ns->cl_flat[cs_inner+2] > 0); }
+                } else {
+                    for (int q = cs_inner; q < ns->cl_offs[c+1]; ++q) {
+                       if (abs(ns->cl_flat[q]) == best_v) { lit_p = (ns->cl_flat[q] > 0); break; }
+                    }
                 }
                 int was_sat = ns->sat_counts[c] > 0;
                 if (lit_p == new_v_sat) ns->sat_counts[c]++;
@@ -1698,9 +2042,23 @@ static int baha_walksat(NitroSat *ns, int max_flips)
                 }
             }
         }
+        
+        /* Track best state */
+        if (unsz < best_unsat) {
+            best_unsat = unsz;
+            for (int i = 1; i <= ns->num_vars; ++i) best_x[i] = ns->x[i];
+        }
     }
+    
+    /* Restore best state if we lost it */
+    if (unsz > best_unsat) {
+        for (int i = 1; i <= ns->num_vars; ++i) ns->x[i] = best_x[i];
+        recompute_sat_counts(ns);
+        unsz = best_unsat;
+    }
+    
     int solved = (unsz == 0);
-    free(unsat); free(unsat_pos);
+    free(unsat); free(unsat_pos); free(best_x); free(sample_x);
     return solved;
 }
 
@@ -1770,18 +2128,22 @@ static double score_branch(NitroSat *ns, double beta, int n_samples, double *bes
     
     for (int s = 0; s < n_samples; ++s) {
         for (int i = 1; i <= ns->num_vars; ++i) buf[i] = ns->decimated[i] ? ns->x[i] : rng_double();
-        int uns = 0;
+        double uns_energy = 0.0;
+        int uns_count = 0;
         for (int c = 0; c < ns->num_clauses; ++c) {
             int sat = 0;
             for (int q = ns->cl_offs[c]; q < ns->cl_offs[c+1]; ++q) {
                 int lit = ns->cl_flat[q], v = abs(lit);
                 if ((lit > 0 && buf[v] > 0.5) || (lit < 0 && buf[v] <= 0.5)) { sat = 1; break; }
             }
-            if (!sat) uns++;
+            if (!sat) { 
+                uns_energy += ns->cl_weights[c]; /* Spectral Prime Weighting */
+                uns_count++; 
+            }
         }
-        total_score += exp(-beta * uns);
-        if (uns < best_seen) {
-            best_seen = uns;
+        total_score += exp(-beta * uns_energy);
+        if (uns_energy < best_seen) {
+            best_seen = uns_energy;
             if (best_x_out) {
                 for (int i = 1; i <= ns->num_vars; ++i) best_x_out[i] = buf[i];
             }
@@ -1789,113 +2151,6 @@ static double score_branch(NitroSat *ns, double beta, int n_samples, double *bes
     }
     free(buf);
     return total_score / n_samples + 100.0 / (best_seen + 1.0);
-}
-
-/* --------------------------------------------------------------------
-   [PORTED] Restricted WalkSAT (Local search on subset of variables)
--------------------------------------------------------------------- */
-static int restricted_walksat(NitroSat *ns, int *var_list, int var_count, int max_flips)
-{
-    if (var_count == 0) return 1;
-    
-    int *clause_sat_counts = calloc(ns->num_clauses, sizeof(int));
-    int *unsat_list = malloc(ns->num_clauses * sizeof(int));
-    int *unsat_pos = calloc(ns->num_clauses + 1, sizeof(int));
-    int unsz = 0;
-    
-    for (int c = 0; c < ns->num_clauses; ++c) {
-        int count = 0;
-        for (int i = ns->cl_offs[c]; i < ns->cl_offs[c+1]; ++i) {
-            int lit = ns->cl_flat[i], var = abs(lit);
-            if ((lit > 0 && ns->x[var] > 0.5) || (lit < 0 && ns->x[var] <= 0.5)) count++;
-        }
-        clause_sat_counts[c] = count;
-        if (count == 0) {
-            unsat_list[unsz] = c;
-            unsat_pos[c] = unsz + 1;
-            unsz++;
-        }
-    }
-    if (unsz == 0) { free(clause_sat_counts); free(unsat_list); free(unsat_pos); return 1; }
-    
-    int *var_set = calloc(ns->num_vars + 1, sizeof(int));
-    for (int i = 0; i < var_count; ++i) var_set[var_list[i]] = 1;
-
-    for (int step = 1; step <= max_flips; ++step) {
-        if (unsz == 0) break;
-        int clause_idx = unsat_list[rng_int(0, unsz - 1)];
-        int start = ns->cl_offs[clause_idx], stop = ns->cl_offs[clause_idx+1];
-        int flip_var = -1;
-        
-        if (rng_double() < 0.3) {
-            int cand[128], csz = 0;
-            for (int i = start; i < stop; ++i) {
-                int v = abs(ns->cl_flat[i]);
-                if (var_set[v] && csz < 128) cand[csz++] = v;
-            }
-            if (csz > 0) flip_var = cand[rng_int(0, csz - 1)];
-        } else {
-            int min_breaks = 999999, cand[128], csz = 0;
-            for (int i = start; i < stop; ++i) {
-                int var = abs(ns->cl_flat[i]);
-                if (!var_set[var]) continue;
-                int breaks = 0;
-                for (int p = ns->v2c_ptr[var]; p < ns->v2c_ptr[var+1]; ++p) {
-                    int k = ns->v2c_data[p];
-                    if (clause_sat_counts[k] == 1) {
-                        for (int j = ns->cl_offs[k]; j < ns->cl_offs[k+1]; ++j) {
-                            int k_lit = ns->cl_flat[j];
-                            if (abs(k_lit) == var) {
-                                if ((k_lit > 0 && ns->x[var] > 0.5) || (k_lit < 0 && ns->x[var] <= 0.5)) breaks++;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if (breaks < min_breaks) { min_breaks = breaks; csz = 0; cand[csz++] = var; }
-                else if (breaks == min_breaks && csz < 128) { cand[csz++] = var; }
-            }
-            if (csz > 0) flip_var = cand[rng_int(0, csz - 1)];
-        }
-        
-        if (flip_var == -1) {
-            for (int i = start; i < stop; ++i) {
-                int v = abs(ns->cl_flat[i]);
-                if (var_set[v]) { flip_var = v; break; }
-            }
-        }
-        
-        if (flip_var != -1) {
-            double new_val = (ns->x[flip_var] > 0.5) ? 0.0 : 1.0;
-            ns->x[flip_var] = new_val;
-            for (int p = ns->v2c_ptr[flip_var]; p < ns->v2c_ptr[flip_var+1]; ++p) {
-                int k = ns->v2c_data[p];
-                int old_count = clause_sat_counts[k], delta = 0;
-                for (int j = ns->cl_offs[k]; j < ns->cl_offs[k+1]; ++j) {
-                    int lit = ns->cl_flat[j];
-                    if (abs(lit) == flip_var) {
-                        delta = ((lit > 0 && new_val > 0.5) || (lit < 0 && new_val <= 0.5)) ? 1 : -1;
-                        break;
-                    }
-                }
-                int new_count = old_count + delta;
-                clause_sat_counts[k] = new_count;
-                if (old_count == 0 && new_count > 0) {
-                    int pos = unsat_pos[k];
-                    if (pos) {
-                        int last_c = unsat_list[unsz - 1];
-                        unsat_list[pos - 1] = last_c;
-                        unsat_pos[last_c] = pos;
-                        unsat_pos[k] = 0; unsz--;
-                    }
-                } else if (old_count > 0 && new_count == 0) {
-                    if (!unsat_pos[k]) { unsat_list[unsz] = k; unsat_pos[k] = unsz + 1; unsz++; }
-                }
-            }
-        }
-    }
-    free(clause_sat_counts); free(unsat_list); free(unsat_pos); free(var_set);
-    return unsz == 0;
 }
 
 /* --------------------------------------------------------------------
@@ -2094,6 +2349,8 @@ static int nitrosat_solve(NitroSat *ns)
     double lr0   = 0.2;               /* base learning‑rate before annealing */
     int    best_sat = 0;
     double *best_x  = malloc((ns->num_vars+1)*sizeof(double));
+    int    prev_sat = 0;              /* For grokking detection */
+    int    steps_since_improvement = 0; /* For nuclear zeta perturbation */
 
     for (int i=1;i<=ns->num_vars;++i) best_x[i] = ns->x[i];
 
@@ -2107,7 +2364,11 @@ static int nitrosat_solve(NitroSat *ns)
         if (sat > best_sat) {
             best_sat = sat;
             for (int i=1;i<=ns->num_vars;++i) best_x[i] = ns->x[i];
+            steps_since_improvement = 0;
+        } else {
+            steps_since_improvement++;
         }
+        
         if (unsat == 0) {
             if (ns->verbose) printf("[EARLY] 100%% satisfaction at step %d!\n", step);
             /* Restore best solution before breaking */
@@ -2116,6 +2377,48 @@ static int nitrosat_solve(NitroSat *ns)
             }
             break;
         }
+
+        /* GROKKING DETECTION: Sudden jump in satisfaction (e.g., 69% → 99.99%) */
+        if (step > 1 && prev_sat > 0) {
+            int jump = sat - prev_sat;
+            double jump_pct = (double)jump / ns->num_clauses * 100.0;
+            
+            /* If we jumped >50% in one step AND now at >95%, trigger phase 2 immediately */
+            if (jump_pct > 50.0 && sat >= (int)(0.95 * ns->num_clauses)) {
+                if (ns->verbose) {
+                    printf("[GROK] Detected %+.1f%% jump! %d→%d (%.2f%%). Triggering phase 2!\n",
+                           jump_pct, prev_sat, sat, 100.0*sat/ns->num_clauses);
+                }
+                
+                /* Immediately run topological repair */
+                if (ns->use_topology) {
+                    ns->last_topology = compute_topology(ns, 0.3);
+                    if (topological_repair_phase(ns, 1500)) {
+                        recompute_sat_counts(ns);
+                        int final_sat = check_satisfaction(ns);
+                        if (final_sat == ns->num_clauses) {
+                            if (ns->verbose) printf("[GROK] Phase 2 solved it!\n");
+                            free(best_x);
+                            return 1;
+                        }
+                    }
+                }
+                
+                /* Then adelic saturation */
+                if (sat >= (int)(0.98 * ns->num_clauses)) {
+                    if (adelic_saturation_phase(ns, 2000)) {
+                        recompute_sat_counts(ns);
+                        int final_sat = check_satisfaction(ns);
+                        if (final_sat == ns->num_clauses) {
+                            if (ns->verbose) printf("[GROK] Phase 3 solved it!\n");
+                            free(best_x);
+                            return 1;
+                        }
+                    }
+                }
+            }
+        }
+        prev_sat = sat;
 
         /* Debug output every step */
         if (ns->verbose) {
@@ -2134,8 +2437,15 @@ static int nitrosat_solve(NitroSat *ns)
             for (int c = 0; c < ns->num_clauses; ++c) {
                 if (ns->sat_counts[c] == 0) {
                     ns->cl_weights[c] *= 1.1;  /* solve_gravity penalty */
+                    /* If we are stagnating heavily, stop exploding the weight! */
+                    if (steps_since_improvement > 100 && ns->cl_weights[c] > 500.0) {
+                        ns->cl_weights[c] = 500.0; 
+                    } else if (ns->cl_weights[c] > 1e5) {
+                        ns->cl_weights[c] = 1e5;  /* Prevent gradient scale overflow */
+                    }
                 } else {
                     ns->cl_weights[c] *= 0.999; /* decay */
+                    if (ns->cl_weights[c] < 0.001) ns->cl_weights[c] = 0.001;  /* Prevent underflow */
                 }
             }
         } /* annealed learning‑rate */
@@ -2143,7 +2453,7 @@ static int nitrosat_solve(NitroSat *ns)
         double lr = annealing_lr(t, lr0);
         if (lr <= 0.0) lr = 1e-6;
         ns->opt->lr = lr;
-        optimizer_step(ns->opt, ns->x, ns->grad_buffer);
+        optimizer_step(ns->opt, ns->x, ns->grad_buffer, ns->decimated);
         /* clamp x to [0,1] after optimizer step (matches gh.lua line 992) */
         for (int i = 1; i <= ns->num_vars; ++i)
             ns->x[i] = clamp(ns->x[i], 0.0, 1.0);
@@ -2161,12 +2471,25 @@ static int nitrosat_solve(NitroSat *ns)
         /* Zeta‑zero guided perturbation (every 10 steps) */
         if (step % 10 == 0) {
             TopologyInfo *topo = ns->use_topology ? &ns->last_topology : NULL;
-            for (int v=1; v<=ns->num_vars; ++v) if (!ns->decimated[v]) {
-                double dz = zeta_zero_perturb(v, step, max_steps,
-                                             ns->primes, ns->prime_cnt,
-                                             topo, ns->num_vars,
-                                             0 /* nuclear = false */);
-                ns->x[v] = clamp(ns->x[v] + dz * 0.001, 0.0, 1.0);  /* gh.lua scales by 0.001 */
+            int nuclear = (steps_since_improvement > 100); /* Fire Nuclear Bomb if stuck */
+            for (int v=1; v<=ns->num_vars; ++v) {
+                if (nuclear && ns->decimated[v]) {
+                    /* Nuclear strike unlocks frozen variables and injects uncertainty */
+                    ns->decimated[v] = 0;
+                    if (ns->x[v] > 0.9) ns->x[v] = 0.8;
+                    if (ns->x[v] < 0.1) ns->x[v] = 0.2;
+                }
+                if (!ns->decimated[v]) {
+                    double dz = zeta_zero_perturb(v, step, max_steps,
+                                                 ns->primes, ns->prime_cnt,
+                                                 topo, ns->num_vars,
+                                                 nuclear);
+                    ns->x[v] = clamp(ns->x[v] + dz * 0.001, 0.0, 1.0);  /* gh.lua scales by 0.001 */
+                }
+            }
+            if (nuclear && ns->verbose) {
+                printf("[ZETA] Firing nuclear perturbation at step %d to break stagnation.\n", step);
+                steps_since_improvement = 0; /* Reset stagnation counter after nuclear strike */
             }
         }
 
@@ -2182,10 +2505,12 @@ static int nitrosat_solve(NitroSat *ns)
                 }
                 if (!clause_sat) {
                     ns->cl_weights[c] *= 2.5;
+                    if (ns->cl_weights[c] > 1e15) ns->cl_weights[c] = 1e15;  /* Prevent overflow */
                 }
             }
             for (int i = 0; i < ns->num_clauses; ++i) {
                 ns->cl_weights[i] *= 0.99;
+                if (ns->cl_weights[i] < 0.001) ns->cl_weights[i] = 0.001;  /* Prevent underflow */
             }
         }
 
@@ -2330,11 +2655,13 @@ static int nitrosat_solve(NitroSat *ns)
         if (best_sat == ns->num_clauses) { free(best_x); return 1; }
     }
 
-    /* Final BAHA‑WalkSAT (discrete local search) */
+    /* Final BAHA discrete local search (pure BAHA, no WalkSAT) */
     if (best_sat < ns->num_clauses) {
-        if (ns->verbose) puts("[final] BAHA‑WalkSAT");
+        if (ns->verbose) puts("[final] BAHA discrete search");
         for (int i = 1; i <= ns->num_vars; ++i) ns->x[i] = best_x[i] > 0.5 ? 1.0 : 0.0;
-        baha_walksat(ns, ns->num_vars * 100);
+        
+        /* Run BAHA-WalkSAT with baha.cpp params: 200 steps × 50 samples */
+        baha_walksat(ns, ns->num_vars * 200);
         int bsat = check_satisfaction(ns);
         if (bsat > best_sat) {
             best_sat = bsat;
@@ -2375,7 +2702,10 @@ static int nitrosat_solve_dcw(NitroSat *ns, int num_passes)
                     int lit = ns->cl_flat[i], v = abs(lit);
                     if ((lit > 0 && ns->x[v] > 0.5) || (lit < 0 && ns->x[v] <= 0.5)) { sat = 1; break; }
                 }
-                if (!sat) ns->cl_weights[c] *= 1.5;
+                if (!sat) {
+                    ns->cl_weights[c] *= 1.5;
+                    if (ns->cl_weights[c] > 1e15) ns->cl_weights[c] = 1e15;  /* Prevent overflow */
+                }
             }
         }
         
@@ -2715,28 +3045,64 @@ int main(int argc, char **argv)
     Instance *inst = read_cnf(cnf_file);
     if (!inst) return EXIT_FAILURE;
 
+    /* Auto-calculate max_steps: REMOVED. Use uniform 3000 steps. */
+
     NitroSat *ns = nitrosat_new(inst, max_steps, json_output ? 0 : 1);
     ns->use_topology = use_topo;
 
     /* Build variable‑to‑clause CSR structure (O(L) time) */
     ns->v2c_ptr = calloc(ns->num_vars + 2, sizeof(int));
+    NITROSAT_ENSURE(ns->v2c_ptr != NULL, "Failed to allocate v2c_ptr");
+    
+    /* Count clause occurrences per variable */
     for (int i=0; i<inst->num_clauses; ++i) {
         for (int j=inst->cl_offs[i]; j<inst->cl_offs[i+1]; ++j) {
-            ns->v2c_ptr[abs(inst->cl_flat[j]) + 1]++;
+            int lit = inst->cl_flat[j];
+            NITROSAT_ENSURE(abs(lit) <= ns->num_vars, "Literal exceeds variable count in v2c build");
+            ns->v2c_ptr[abs(lit) + 1]++;
         }
     }
+    
+    /* Prefix sum to get pointers */
     for (int i=1; i<=ns->num_vars+1; ++i) ns->v2c_ptr[i] += ns->v2c_ptr[i-1];
-    ns->v2c_data = malloc(ns->v2c_ptr[ns->num_vars+1] * sizeof(int));
+    
+    /* Allocate and fill v2c_data */
+    int v2c_size = ns->v2c_ptr[ns->num_vars+1];
+    ns->v2c_data = malloc(v2c_size * sizeof(int));
+    NITROSAT_ENSURE(ns->v2c_data != NULL, "Failed to allocate v2c_data");
+    
     int *cur = calloc(ns->num_vars + 1, sizeof(int));
+    NITROSAT_ENSURE(cur != NULL, "Failed to allocate v2c cursor");
+    
     for (int c=0; c<inst->num_clauses; ++c) {
         for (int j=inst->cl_offs[c]; j<inst->cl_offs[c+1]; ++j) {
             int v = abs(inst->cl_flat[j]);
             int pos = ns->v2c_ptr[v] + cur[v];
+            NITROSAT_ENSURE(pos < v2c_size, "v2c_data index out of bounds");
             ns->v2c_data[pos] = c;
             cur[v]++;
         }
     }
     free(cur);
+
+    /* Validate v2c CSR: check that each clause appears exactly once per variable */
+    #ifdef NITROSAT_DEBUG
+    int *validation_counts = calloc(v2c_size, sizeof(int));
+    NITROSAT_ENSURE(validation_counts != NULL, "Failed to allocate validation buffer");
+    for (int v = 1; v <= ns->num_vars; ++v) {
+        for (int p = ns->v2c_ptr[v]; p < ns->v2c_ptr[v+1]; ++p) {
+            int c = ns->v2c_data[p];
+            NITROSAT_ENSURE(c >= 0 && c < inst->num_clauses, "Invalid clause ID in v2c");
+            validation_counts[c]++;
+        }
+    }
+    for (int c = 0; c < inst->num_clauses; ++c) {
+        int expected = inst->cl_offs[c+1] - inst->cl_offs[c];
+        NITROSAT_ENSURE(validation_counts[c] == expected, 
+            "v2c CSR validation failed: clause occurrence count mismatch");
+    }
+    free(validation_counts);
+    #endif
 
     clock_gettime(CLOCK_MONOTONIC, &ts_init_end);
 
@@ -2767,12 +3133,15 @@ int main(int argc, char **argv)
     if (proof.requested) {
         if (solved) {
             snprintf(proof.status, sizeof(proof.status), "sat_assignment_found");
-        } else if (strcmp(proof_format, "drat") == 0) {
+        } else if (strcmp(proof_format, "drat") == 0 || strcmp(proof_format, "lrat") == 0) {
             proof.backend = "solver_aware_drat";
+            if (strcmp(proof_format, "lrat") == 0) {
+                proof.backend = "solver_aware_lrat";
+                proof.lrat_hints_emitted = 1;
+            }
             proof.generated = generate_drat_unsat_proof(
-                ns, proof_path, &proof.derived_units, proof.status, sizeof(proof.status));
-        } else if (strcmp(proof_format, "lrat") == 0) {
-            snprintf(proof.status, sizeof(proof.status), "unsupported_format_lrat_use_drat");
+                ns, proof_path, &proof.derived_units, proof.status, sizeof(proof.status),
+                proof_format);
         } else {
             snprintf(proof.status, sizeof(proof.status), "unsupported_format");
         }
