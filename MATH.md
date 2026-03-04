@@ -175,7 +175,7 @@ The following table maps each mathematical claim directly to its implementation 
 | Betti numbers $\beta_0, \beta_1$ | Lines 485-491 | ✓ Union-find + edge counting |
 | Topological repair phase | Lines 1207-1278 | ✓ Uses $\beta_1$ to guide repair |
 
-This is not window dressing. The code is a direct, faithful implementation of the mathematical machinery in Sections 1-5. Every major component — prime weights, log-barrier, entropy, heat kernel, spectral init, BAHA (Lambert-W + fracture detection), persistent homology — is present and matches the math.
+The code is a direct, faithful implementation of the mathematical machinery in Sections 1-5. Every major component — prime weights, log-barrier, entropy, heat kernel, spectral init, BAHA (Lambert-W + fracture detection), persistent homology — is present and matches the math.
 
 ---
 
@@ -264,7 +264,7 @@ This is **far above** β* = 0.013-0.017. So NitroSAT operates deep in the strong
 
 **To see the transition:** You'd need to lower heat_beta to ~0.001 to make effective β close to β*.
 
-#### The Killer Graph
+#### The Critical Graph
 
 Plot: **$\beta^* \times \frac{\ln\ln K}{\ln K}$ vs $\ln K$**
 
@@ -293,17 +293,17 @@ A larger $\lambda_2$ directly increases $\mu_{eff}$, which means faster exponent
 - **Clique coloring**: Dense local structure means high $\lambda_2$ — even better convergence.
 - **Ramsey constructions**: Highly symmetric. The eigenvectors are delocalized Fourier-like modes, so diffusion is extremely efficient.
 
-#### Why Entropy Is the Secret Weapon on Symmetric Problems
+#### The Role of Entropy on Symmetric Problems
 
-Here's something the benchmark data reveals that we haven't stated explicitly: **the hardest instances for CDCL are often the easiest for NitroSAT**.
+Here's something the benchmark data reveals that we haven't stated explicitly: **structured instances that are challenging for CDCL often perform well with NitroSAT**.
 
-Ramsey $R(5,5,5)$. Clique coloring. Latin squares. These destroy CDCL because they have **massive symmetry** — the solver branches, learns a clause, but the same conflict reappears in a different symmetric form. Clause learning doesn't transfer across symmetry orbits.
+Ramsey $R(5,5,5)$. Clique coloring. Latin squares. These present challenges for CDCL because they have **massive symmetry** — the solver branches, learns a clause, but the same conflict reappears in a different symmetric form. Clause learning doesn't transfer across symmetry orbits.
 
-Our entropy term does something CDCL fundamentally cannot: it operates on **all symmetric copies simultaneously**. When $x_i = 0.5$ for all variables in a symmetry orbit, the entropy gradient pushes them all simultaneously toward the correct assignment. We're not breaking symmetry by guessing — we're letting the barrier forces differentiate the variables continuously. The symmetry breaks *naturally* as $\Pi_c$ values diverge between clauses.
+Our entropy term does something CDCL fundamentally cannot: it operates on **all symmetric copies simultaneously**. When $x_i = 0.5$ for all variables in a symmetry orbit, the entropy gradient pushes them all simultaneously toward the correct assignment. The entropy approach allows symmetry to break naturally as $\Pi_c$ values diverge between clauses.
 
-This is why 5/5 seeds on `cliquecol_80_10_10` all hit 100%. It's not luck. The entropy + diffusion combination is **symmetry-aware by construction**.
+This is why 5/5 seeds on `cliquecol_80_10_10` all hit 100%. The entropy + diffusion combination is **symmetry-aware by construction**.
 
-#### Why Permutation Invariance Is Load-Bearing Math, Not a Demo
+#### The Significance of Permutation Invariance
 
 The 0.0000% standard deviation across 20 permutations is actually proving something non-trivial. It means our fixed point $x^*$ is determined entirely by the **spectrum of the constraint hypergraph**, not by the labeling.
 
@@ -315,23 +315,23 @@ CDCL does not have this property. Its fixed points depend on branching order. Ou
 
 This number is not arbitrary. Random 3-SAT at ratio 4.26 has a known energy landscape structure: the satisfying assignments (when they exist) are clustered in exponentially many small clusters separated by large barriers. The **overlap gap property** means any local algorithm — continuous or discrete — cannot efficiently find a satisfying assignment.
 
-NitroSAT hits 99.6% because that's where the free energy minimum sits in the **replica-symmetric phase** of the random 3-SAT energy landscape. We're finding the thermodynamic ground state of the MaxSAT relaxation, not the combinatorial solution. The 0.4% gap is the energy cost of the clustering barrier — and crucially, it's **constant across $n$**, which means we're hitting a thermodynamic limit, not a finite-size effect.
+NitroSAT achieves 99.6% because that's where the free energy minimum sits in the **replica-symmetric phase** of the random 3-SAT energy landscape. The solver finds the thermodynamic ground state of the MaxSAT relaxation, not the combinatorial solution. The 0.4% gap is the energy cost of the clustering barrier — and crucially, it's **constant across $n$**, which indicates a thermodynamic limit, not a finite-size effect.
 
-This is consistent with spin glass theory. The replica-symmetric free energy of random $k$-SAT at the threshold has a known ground state energy density. Our 99.6% is the physics wall that *all* local algorithms hit.
+This is consistent with spin glass theory. The replica-symmetric free energy of random $k$-SAT at the threshold has a known ground state energy density. Our 99.6% represents the limit that *all* local algorithms encounter.
 
-#### Why XOR-SAT Works When It Shouldn't
+#### Why XOR-SAT Performs Well
 
-Standard continuous relaxations fail on XOR-SAT because parity constraints over $GF(2)$ produce **flat gradient directions** — at $x_i = 0.5$ for all variables in a parity chain, the gradient is exactly zero. The solver has no signal.
+Standard continuous relaxations fail on XOR-SAT because parity constraints over $GF(2)$ produce **flat gradient directions** — at $x_i = 0.5$ for all variables in a parity chain, the gradient is exactly zero, providing no directional information.
 
-Two things save us. First, the entropy term breaks this: the entropic force $\ln((1-x)/x)$ is zero only at exactly $x = 0.5$, but any infinitesimal perturbation creates a nonzero gradient. The system never stays at the flat point. Second, Laplacian diffusion **propagates parity information along chains** — when one variable in a parity chain gets a gradient signal, diffusion spreads it to its neighbors, effectively implementing Gaussian elimination in continuous time.
+Two factors address this. First, the entropy term breaks this: the entropic force $\ln((1-x)/x)$ is zero only at exactly $x = 0.5$, but any infinitesimal perturbation creates a nonzero gradient. The system never stays at the flat point. Second, Laplacian diffusion **propagates parity information along chains** — when one variable in a parity chain gets a gradient signal, diffusion spreads it to its neighbors, effectively implementing Gaussian elimination in continuous time.
 
-The $\beta_1 = 98$ persistent homology detection catches the actual cycle structure of the XOR constraint graph. We're detecting the topological obstruction that makes XOR hard and using it to guide the flow.
+The $\beta_1 = 98$ persistent homology detection catches the actual cycle structure of the XOR constraint graph. The solver detects the topological obstruction that makes XOR hard and uses it to guide the flow.
 
 #### Where It Struggles — And Why
 
-Tiling (99.1%), subset cardinality (95.7%), extreme numerical (95.69%), and Sudoku (99.92% but never perfect) share one property: **high-weight frustrated constraints with no algebraic regularity**. The spectral gap $\lambda_2$ is small, the clause structure has no symmetry for entropy to exploit, and the barrier forces create a rough landscape with many near-degenerate local minima. We're outside the convex regime from Theorem 6.1 for those instances.
+Tiling (99.1%), subset cardinality (95.7%), extreme numerical (95.69%), and Sudoku (99.92% but never perfect) share one property: **high-weight frustrated constraints with no algebraic regularity**. The spectral gap $\lambda_2$ is small, the clause structure has no symmetry for entropy to exploit, and the barrier forces create a rough landscape with many near-degenerate local minima. These instances are outside the convex regime from Theorem 6.1.
 
-Sudoku is particularly interesting — 99.92% but never perfect. Sudoku has regularity but also **hard uniqueness constraints** (each digit appears exactly once in each row/column/box). Those cardinality constraints create tight coupling that our soft barrier cannot enforce exactly. We're one or two variables away from a solution but the barrier landscape has a very narrow basin around the exact solution.
+Sudoku is particularly interesting — 99.92% but never perfect. Sudoku has regularity but also **hard uniqueness constraints** (each digit appears exactly once in each row/column/box). Those cardinality constraints create tight coupling that the soft barrier cannot enforce exactly. The solver may be one or two variables away from a solution but the barrier landscape has a very narrow basin around the exact solution.
 
 #### The One-Sentence Summary
 
@@ -369,7 +369,7 @@ There is a deeper reason why prime weights are uniquely suited for constraint we
 - **Unique spectral identity**: The product $\prod_{c \in S} p_c$ for any subset of clauses $S$ is unique. This gives each subproblem a distinct "fingerprint" in the Archimedean (prime-by-prime) topology.
 - **Gauge invariance follows naturally**: Since the weights are determined by the prime sequence (a universal invariant), they depend only on clause *index*, not on variable labeling. Relabeling variables permutes clauses but preserves the set of prime weights — hence 0.0000% permutation variance.
 
-#### The Punchline
+#### Summary
 
 Primes are to arithmetic what UNSAT cores are to constraint satisfaction: the irreducible obstructions that cannot be decomposed further. The Riemann Hypothesis asserts that these obstructions are distributed as *regularly as possible* — with fluctuations bounded by $O(\sqrt{x})$. NitroSAT's prime weighting embeds this regularity directly into the gradient flow.
 
@@ -435,7 +435,7 @@ In February 2026, independent verification tested whether prime weights are **ca
 | Betti Number (β₁) | **20** | **79** |
 | Topology Complexity Trend | 0.0 | 0.78 |
 
-**Key Finding**: Prime weights reduced the topological complexity (β₁) by **75%** and achieved **4x faster convergence**. The uniform weight system "hallucinates" spurious constraint cycles that don't actually exist in the problem structure.
+**Key Finding**: Prime weights reduced the topological complexity (β₁) by **75%** and achieved **4x faster convergence**. The uniform weight system produces spurious constraint cycles that don't actually exist in the problem structure.
 
 #### Results on Random 3-SAT (K=850)
 

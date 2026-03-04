@@ -17,15 +17,15 @@
 
 ## ⚡ Why NitroSAT?
 
-Unlike traditional solvers that stall on hard combinatorial bottlenecks, NitroSAT treats SAT as a physics-informed dynamical system. It achieves **99.5%+ satisfaction** on million-clause instances in seconds.
+Unlike traditional solvers that struggle with hard combinatorial bottlenecks, NitroSAT treats SAT as a physics-informed dynamical system. It achieves **99.5%+ satisfaction** on million-clause instances in seconds.
 
 - **Linear Scaling**: $O(M)$ time complexity relative to the number of clauses.
 - **Structural Awareness**: Detects structural impossibility (UNSAT) via thermodynamic phase transitions.
 - **Scale**: Perfectly solves a 350,000-clause clique coloring instance in ~3.5s.
 - **Enterprise Scale**: Solves **80+ million clause** scheduling problems on a single laptop.
-- **Zero Tuning**: works out-of-the-box on Scheduling, Ramsey, Coloring, and N-Queens.
+- **Default Configuration**: works out-of-the-box on Scheduling, Ramsey, Coloring, and N-Queens.
 
-If you have a constraint satisfaction problem with 100k+ clauses and need a fast approximate solution, try this. It won't guarantee 100% but it'll get you 99.5%+ in seconds.
+If you have a constraint satisfaction problem with 100k+ clauses and need a fast approximate solution, try this. It does not guarantee 100% but typically achieves 99.5%+ satisfaction in seconds.
 
 
 ## 🎨 How it Works
@@ -231,7 +231,7 @@ If you use NitroSAT in your research, please cite:
 
 If NitroSAT helped you solve a massive constraint problem, save on cloud compute costs, or verify a hardware circuit, please consider supporting the project! 
 
-Your donations keep the math flowing and help maintain this engine as a free, open-source tool for the community.
+Your donations help maintain this engine as a free, open-source tool for the community.
 
 Sponsor link: https://github.com/sponsors/sethuiyer/
 **License:** Apache 2.0
@@ -301,7 +301,7 @@ The core ideas — multiplicative calculus, spectral phase transitions, quantum 
 
 ---
 
-If any of these ideas proved useful to you, I'd genuinely like to hear about it.
+If any of these ideas proved useful to you, please consider sharing your results.
 
 **Author:** Sethu Iyer(https://orcid.org/0009-0008-5446-2856) — shunyabarlabs@zohomail.com
 
