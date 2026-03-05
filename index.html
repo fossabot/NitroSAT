@@ -3,8 +3,19 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Constraint Satisfaction as Langevin Flow on the Prime-Weighted Hyperbolic Manifold</title>
-<meta name="description" content="Prime Weights, Spectral Gaps, and a Connection to the Riemann Hypothesis">
+<title>NitroSAT - Constraint Satisfaction as Langevin Flow on the Prime-Weighted Hyperbolic Manifold</title>
+<meta name="description" content="NitroSAT: A physics-informed MaxSAT solver using prime-weighted gradient flow on hyperbolic manifolds. Achieves 99.5%+ satisfaction with O(M) linear scaling. Includes BAHA, persistent homology, and connections to Riemann Hypothesis.">
+<meta name="keywords" content="SAT solver, MaxSAT, constraint satisfaction, prime numbers, Riemann hypothesis, Riemannian optimization, hyperbolic manifold, persistent homology, spectral methods, heat kernel">
+<meta name="author" content="Sethurathienam Iyer">
+<meta name="robots" content="index, follow">
+<meta property="og:title" content="NitroSAT - Physics-Informed MaxSAT Solver">
+<meta property="og:description" content="A SAT solver that uses prime-weighted gradient flow on hyperbolic manifolds. 99.5%+ satisfaction with O(M) linear scaling.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://sethuiyer.github.io/NitroSAT/">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="NitroSAT - Physics-Informed MaxSAT Solver">
+<meta name="twitter:description" content="A SAT solver using prime weights, hyperbolic geometry, and gradient flow. 99.5%+ satisfaction.">
+<link rel="canonical" href="https://sethuiyer.github.io/NitroSAT/">
 
 <!-- KaTeX for math -->
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
@@ -17,6 +28,141 @@
     ],
     throwOnError: false
   });"></script>
+
+<!-- PostHog Analytics -->
+<script>
+(function(fn){if(!window.posthog){window.posthog=fn;}else{fn(window.posthog);}})(function(posthog){
+  posthog.init('phc_KuQ1ANBEoYQN4m5NqbCqEAHmjodNnSAGkFbI1QvC279',{
+    api_host:'https://us.i.posthog.com',
+    toolbar:'toolbar',
+    instrument:true
+  });
+});
+</script>
+
+<!-- PostHog Enhanced Analytics -->
+<script>
+// Wait for PostHog to load
+window.addEventListener('load', function() {
+  if (!window.posthog) return;
+
+  const posthog = window.posthog;
+
+  // 1. Capture page load with metadata
+  setTimeout(() => {
+    const mathCount = document.querySelectorAll('.katex, .katex-display').length;
+    const wordCount = document.body.innerText.split(/\s+/).length;
+    const headingCount = document.querySelectorAll('h2, h3').length;
+
+    posthog.capture('page_loaded', {
+      math_count: mathCount,
+      word_count: wordCount,
+      heading_count: headingCount,
+      url: window.location.href,
+      referrer: document.referrer
+    });
+  }, 2000);
+
+  // 2. Scroll depth tracking
+  let maxScroll = 0;
+  window.addEventListener('scroll', () => {
+    const scrollPercent = Math.round(
+      (window.scrollY / (document.body.scrollHeight - window.innerHeight)) * 100
+    );
+    if (scrollPercent > maxScroll) {
+      maxScroll = scrollPercent;
+      // Track milestones: 25%, 50%, 75%, 100%
+      if (maxScroll > 0 && maxScroll % 25 === 0) {
+        posthog.capture('scroll_depth', { percent: maxScroll });
+      }
+    }
+  });
+
+  // 3. Section view tracking (IntersectionObserver)
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        posthog.capture('section_viewed', {
+          section: entry.target.id || entry.target.textContent.substring(0, 50),
+          section_type: entry.target.tagName
+        });
+      }
+    });
+  }, { threshold: 0.3 });
+
+  document.querySelectorAll('h2, h3, figure').forEach(el => observer.observe(el));
+
+  // 4. Track external link clicks
+  document.querySelectorAll('a[href^="http"]').forEach(link => {
+    link.addEventListener('click', () => {
+      const isExternal = link.hostname !== window.location.hostname;
+      posthog.capture('link_clicked', {
+        url: link.href,
+        is_external: isExternal,
+        link_text: link.textContent.substring(0, 50),
+        link_type: link.hostname.includes('github') ? 'github' :
+                   link.hostname.includes('zenodo') ? 'zenodo' :
+                   link.hostname.includes('youtube') ? 'video' :
+                   link.hostname.includes('arxiv') ? 'arxiv' : 'other'
+      });
+    });
+  });
+
+  // 5. Track code block copying
+  document.querySelectorAll('pre').forEach(pre => {
+    pre.style.cursor = 'pointer';
+    pre.title = 'Click to copy code';
+    pre.addEventListener('click', () => {
+      const code = pre.textContent;
+      navigator.clipboard.writeText(code);
+      posthog.capture('code_copied', {
+        code_length: code.length,
+        code_preview: code.substring(0, 100)
+      });
+    });
+  });
+
+  // 6. Track theorem/proof expansions
+  document.querySelectorAll('.theorem-box, .proof-box').forEach(el => {
+    observer.observe(el);
+  });
+
+  // 7. Track time on page (heartbeat every 30s)
+  let timeOnPage = 0;
+  setInterval(() => {
+    timeOnPage += 30;
+    posthog.capture('heartbeat', { seconds_on_page: timeOnPage });
+  }, 30000);
+
+  // 8. Track when user leaves
+  window.addEventListener('beforeunload', () => {
+    posthog.capture('page_left', {
+      time_on_page: Math.round(performance.now() / 1000),
+      final_scroll_percent: maxScroll
+    });
+  });
+
+  // 9. Set user properties
+  try {
+    posthog.people.set({
+      browser: navigator.userAgent.includes('Chrome') ? 'Chrome' :
+              navigator.userAgent.includes('Firefox') ? 'Firefox' :
+              navigator.userAgent.includes('Safari') ? 'Safari' : 'Other',
+      platform: /Mobi|Android/i.test(navigator.userAgent) ? 'Mobile' : 'Desktop',
+      screen_width: screen.width,
+      language: navigator.language
+    });
+  } catch(e) {}
+
+  // 10. Enable session recording
+  if (posthog.sessionRecording) {
+    posthog.sessionRecording.start();
+  }
+});
+</script>
+
+<!-- Beampipe Analytics -->
+<script async defer src="https://beampipe.io/js/tracker.js" data-beampipe-domain="sethuiyer.github.io"></script>
 
 <!-- Fonts -->
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -524,7 +670,7 @@ li {
      ============================================================ -->
 <div class="d-article">
 <div class="d-title-section">
-  <h1 class="d-title">Constraint Satisfaction as Langevin Flow on the Prime-Weighted Hyperbolic Manifold</h1>
+  <h1 class="d-title">NitroSAT - Constraint Satisfaction as Langevin Flow on the Prime-Weighted Hyperbolic Manifold</h1>
   <p class="d-subtitle">Prime Weights, Spectral Gaps, and a Connection to the Riemann Hypothesis</p>
   <div class="d-byline">
     <div class="byline-block">
@@ -598,6 +744,7 @@ li {
     <li><a href="#sec-conclusion">Conclusion</a></li>
     <li><a href="#sec-navokoj">Navokoj: Production API</a></li>
     <li><a href="#sec-open-source">Reproducibility and Open Source Rationale</a></li>
+    <li><a href="#sec-parallel">Related Papers</a></li>
   </ol>
 </nav>
 
@@ -605,6 +752,11 @@ li {
      1. INTRODUCTION
      ============================================================ -->
 <h2 id="sec-intro">1. Introduction</h2>
+
+<figure class="slide-inline">
+  <img src="slides/0.png" alt="Slide 0: Performance Overview">
+  <figcaption>NitroSAT is a high-performance linear-time MaxSAT approximator achieving 99.5%+ satisfaction on hard structured instances.</figcaption>
+</figure>
 
 <p>This document presents a formal mathematical framework in which constraint satisfaction, prime number distribution, and the Chebyshev error competition share a common mathematical structure under the assumptions stated herein. A SAT solver becomes a gradient flow on a Riemannian manifold. Clause weights become prime masses on the boundary. The stability of the solver at scale becomes a physical instantiation of the tradeoff between geometric spectral decay and the asymptotic distribution of primes.</p>
 
@@ -645,6 +797,11 @@ li {
 
 <h3 id="sec-disk">2.1 The Inverted Poincaré Disk ($\mathbb{D}^*$)</h3>
 
+<figure class="slide-inline">
+  <img src="slides/2.png" alt="Slide 2: Continuous Relaxation">
+  <figcaption>Using Adelic geometry to relax variables over the reals [0,1].</figcaption>
+</figure>
+
 <p>The space begins with the standard open unit disk, $\mathbb{D} = \{z \in \mathbb{C} : |z| < 1\}$. An <strong>inverted metric $g^*$</strong> is defined on $\mathbb{D} \setminus \{0\}$ using the conformal inversion $z \mapsto 1/z$.</p>
 
 <p>The resulting metric tensor is:</p>
@@ -658,6 +815,11 @@ $$d^*(0, R) = \int_R^1 \frac{2}{r(1-r^2)}dr = \ln\!\left(\frac{1-R^2}{R^2}\right
 <span class="sidenote">Evaluating the limits: as $R \to 0$, $d^* \to \infty$, and as $R \to 1$, $d^* \to 0$. The origin of the disk is infinitely far from everything&mdash;a geometric manifestation of maximum uncertainty.</span>
 
 <h3 id="sec-necklace">2.2 The Prime Necklace (Boundary Conditions)</h3>
+
+<figure class="slide-inline">
+  <img src="slides/4.png" alt="Slide 4: Prime Weighting">
+  <figcaption>Number-theoretic weighting using primes to prioritize clause satisfaction.</figcaption>
+</figure>
 
 <p>A discrete distribution of the first $K$ primes, denoted $\mathbb{P}_K = \{p_1, p_2, \dots, p_K\}$, is placed on the boundary $\partial \mathbb{D}^*$ where $|z|=1$.</p>
 
@@ -782,6 +944,11 @@ $$E_{\text{kin}}[x] = \frac{1}{2} \int_{\mathbb{D}^*} |\nabla_{g^*} x|^2 \, d\mu
 
 $$E_{\text{pot}}[x] = - \sum_{c=1}^m W(p_c) \ln\!\left(10^{-6} + 1 - \prod_{i \in c} L_i(x_i)\right)$$
 
+<figure class="slide-inline">
+  <img src="slides/5.png" alt="Slide 5: Log-Zeta Barrier">
+  <figcaption>Smooth energy landscape via log-barrier penalty terms.</figcaption>
+</figure>
+
 <h3>3.4 Thermodynamic Free Energy</h3>
 
 <p>To maintain thermodynamic bounds, we introduce an entropy regularization term $S[x]$. Variables are clamped to $[10^{-9}, 1 - 10^{-9}]$:</p>
@@ -814,10 +981,20 @@ $$- \frac{\delta E_{\text{pot}}}{\delta x_v} = \sum_{c \ni v} W(p_c) \cdot \frac
 
 $$\frac{1}{\beta} \frac{\delta S}{\delta x_v} = \frac{1}{\beta} \ln\!\left(\frac{1 - x_v}{x_v}\right)$$
 
+<figure class="slide-inline">
+  <img src="slides/6.png" alt="Slide 6: Entropy & Momentum">
+  <figcaption>NADAM optimization with Adelic momentum and entropy regularization.</figcaption>
+</figure>
+
 <!-- ============================================================
      4. IMPLEMENTATION
      ============================================================ -->
 <h2 id="sec-implementation">4. Implementation</h2>
+
+<figure class="slide-inline">
+  <img src="slides/3.png" alt="Slide 3: Spectral Initialization">
+  <figcaption>XOR-Laplacian power iteration to find balanced starting points.</figcaption>
+</figure>
 
 <h3>4.1 The Isomorphism to <code>nitrosat.c</code></h3>
 
@@ -884,6 +1061,11 @@ ns<span class="op">-&gt;</span>heat_mult_buffer[i] <span class="op">=</span> <sp
 
 <span class="sidenote">No other weighting produces this specific $\ln K / \ln\ln K$ scaling law. It is a direct signature of the Prime Number Theorem operating through the weight function.</span>
 
+<figure class="slide-inline">
+  <img src="slides/7.png" alt="Slide 7: BAHA & Lambert-W">
+  <figcaption>Branch-Aware Holonomy Annealing escapes local minima via branch jumps.</figcaption>
+</figure>
+
 <h3>5.3 Theorem 1: Quadratic Gradient Vanishing in Inverse Hyperbolic Space</h3>
 
 <div class="theorem-box">
@@ -924,6 +1106,11 @@ ns<span class="op">-&gt;</span>heat_mult_buffer[i] <span class="op">=</span> <sp
   <p>The BAHA teleportation jump is an exact analytic transition forced by the total collapse of Fisher Information at the Laplace horizon.</p>
   <div class="qed">$\blacksquare$</div>
 </div>
+
+<figure class="slide-inline">
+  <img src="slides/8.png" alt="Slide 8: Fracture Detection">
+  <figcaption>Statistical phase transition detection triggers BAHA jumps.</figcaption>
+</figure>
 
 <h3>5.5 Theorem 3: Implicit Spectral Preconditioning via Prime Variance</h3>
 
@@ -1011,6 +1198,21 @@ $$\dot{x}_i = -x_i(1-x_i)\frac{\partial F}{\partial x_i}$$
      6. EMPIRICAL VERIFICATION
      ============================================================ -->
 <h2 id="sec-empirical">6. Empirical Verification</h2>
+
+<figure class="slide-inline">
+  <img src="slides/9.png" alt="Slide 9: Persistent Homology">
+  <figcaption>Analyzing topological "holes" in the satisfaction manifold.</figcaption>
+</figure>
+
+<figure class="slide-inline">
+  <img src="slides/10.png" alt="Slide 10: Topological Repair">
+  <figcaption>Targeted local repair of manifold defects using β₁ guidance.</figcaption>
+</figure>
+
+<figure class="slide-inline">
+  <img src="slides/11.png" alt="Slide 11: Adelic Saturation">
+  <figcaption>Final multi-scale repair phase using harmonic saturation.</figcaption>
+</figure>
 
 <p>All benchmarks were executed on an AMD Ryzen 5 5600H @ 4.280 GHz (single core) using the default NitroSAT configuration. The test corpus spans 420+ instances across structured, random, adversarial, and real-world problem families. Unless otherwise noted, the C engine is used; the LuaJIT engine is identified where applicable.</p>
 
@@ -1653,6 +1855,8 @@ $$1 - \sigma > \gamma$$
   <li id="ref-bulatov"><strong>Bulatov, A. A. &amp; Kazeminia, S. (2024).</strong> "Complexity Classification of Counting Graph Homomorphisms." <em>SIAM J. Computing</em>. <a href="https://doi.org/10.1137/23M15200">DOI: 10.1137/23M15200</a>.</li>
   <li id="ref-feng"><strong>Feng, C. &amp; Sathasivam, S. (2024).</strong> "Dynamic Evolution of Constrained SAT Problems: A Hopfield Neural Network Approach." <em>Neural Networks and Applications</em>. <a href="https://doi.org/10.1016/j.neunet.2023.10.022">DOI: 10.1016/j.neunet.2023.10.022</a>.</li>
   <li id="ref-mo"><strong>Mo, H. et al. (2021).</strong> "Phase Transition for Random Regular Exact (s,c,k)-SAT." <em>J. Statistical Mechanics</em>. <a href="https://doi.org/10.1088/1742-5468/abdc42">DOI: 10.1088/1742-5468/abdc42</a>.</li>
+  <li id="ref-wang"><strong>Wang, Y. &amp; Flouris, T. (2025).</strong> "Hyperbolic Optimization: Riemannian Stochastic Gradient Descent in the Poincaré Ball." <em>arXiv</em>. <a href="https://doi.org/10.48550/arXiv.2509.25206">DOI: 10.48550/arXiv.2509.25206</a>. (Extends Riemannian SGD to the Poincaré ball—core to NitroSAT's inverted disk geometry and hyperbolic gradient flow).</li>
+  <li id="ref-perturb"><strong>Tropp, J. et al. (2011).</strong> "A Study on Perturbation Analysis of Spectral Preconditioners." <em>arXiv</em>. <a href="https://doi.org/10.48550/arXiv.1110.2105">DOI: 10.48550/arXiv.1110.2105</a>. (Spectral preconditioning bounds via eigenvector analysis—mirrors NitroSAT's prime weights for condition number O(1)).</li>
 </ol>
 </div>
 
@@ -1703,6 +1907,11 @@ $$1 - \sigma > \gamma$$
      13. CONCLUSION
      ============================================================ -->
 <h2 id="sec-conclusion">13. Conclusion</h2>
+
+<figure class="slide-inline">
+  <img src="slides/12.png" alt="Slide 12: Performance Results">
+  <figcaption>Verified O(M) scaling across benchmark suites.</figcaption>
+</figure>
 
 <p>The $\beta_1$ ablation establishes that prime weights are causally significant&mdash;they directly alter the topology of the constraint manifold. By assigning each clause a unique prime-based mass, the gradient flow encounters fewer spectral collisions, yielding:</p>
 
@@ -1819,6 +2028,38 @@ $$1 - \sigma > \gamma$$
 <pre><code>gcc -O3 -march=native -std=c99 nitrosat.c -o nitrosat -lm</code></pre>
 
 <p>The empirical validation loop closes only when any researcher can compile, execute, and observe the theory behaving as predicted on the published benchmark instances.</p>
+
+<figure class="slide-inline">
+  <img src="slides/13.png" alt="Slide 13: Summary">
+  <figcaption>Efficient physics-inspired optimization for complex MaxSAT problems.</figcaption>
+</figure>
+
+<!-- ============================================================
+     PARALLEL PAPERS
+     ============================================================ -->
+<h2 id="sec-parallel">Related Papers</h2>
+
+<p>Explore the broader research ecosystem around physics-inspired SAT solving:</p>
+
+<table>
+<thead>
+  <tr><th>Paper</th><th>Description</th><th>Links</th></tr>
+</thead>
+<tbody>
+  <tr>
+    <td><strong>BAHA: Branch-Aware Holonomy Annealing</strong></td>
+    <td>The Lambert-W teleportation mechanism for escaping topological fractures in constraint landscapes.</td>
+    <td><a href="https://doi.org/10.5281/zenodo.18373732">DOI</a> · <a href="https://sethuiyer.github.io/baha/">Web</a></td>
+  </tr>
+  <tr>
+    <td><strong>Casimir-SAT: When Boolean Logic Meets the Casimir Effect</strong></td>
+    <td>Foundational work introducing continuous relaxation, Langevin dynamics, and free energy minimization for SAT.</td>
+    <td><a href="https://doi.org/10.5281/zenodo.17394165">DOI</a> · <a href="https://sethuiyer.github.io/casimir-sat-solver/">Web</a></td>
+  </tr>
+</tbody>
+</table>
+
+<p>These papers form the theoretical foundation for NitroSAT's physics-inspired approach to constraint satisfaction.</p>
 
 <!-- ============================================================
      FOOTER
