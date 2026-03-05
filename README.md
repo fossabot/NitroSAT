@@ -33,14 +33,6 @@ The solver consistently achieves **99.5%+ satisfaction** on million-clause insta
 - **No External Dependencies** — Standalone C99 implementation
 - **Lua Implementation** — LuaJIT version available via [Codeberg](https://codeberg.org/sethuiyer/NitroSAT)
 
-# Related Links
-Paper: https://sethuiyer.codeberg.page/NitroSAT/ and MATH.md
-
-Landing Page: https://nitrosat.lovable.app/
-
-Video: https://www.youtube.com/watch?v=KDYmkMYjeY8
-
-
 ---
 
 ## Performance Highlights
