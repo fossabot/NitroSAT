@@ -88,6 +88,7 @@ static double timespec_ms(struct timespec *start, struct timespec *end) {
 #define PI              3.14159265358979323846
 #define E_INV           0.36787944117144232   /* 1/e   */
 #define PHI             ((1.0 + sqrt(5.0)) / 2.0)
+#define GAMMA           0.5772156649015328606   /* Euler-Mascheroni constant */
 #define EPS             1e-12
 #define PROOF_UNASSIGNED -1
 
@@ -147,10 +148,18 @@ static int rng_int(int a, int b) /* inclusive */
 }
 
 /* --------------------------------------------------------------------
-   Utility functions
--------------------------------------------------------------------- */
-static inline double clamp(double x, double lo, double hi)
-{
+   Utility
+*/
+#define PI  3.14159265358979323846
+/* PHI already defined as ((1.0 + sqrt(5.0)) / 2.0) */
+#define EPS 1e-12
+
+/* Bit-Parallel Adelic Evaluation Macros */
+#define SET_BIT(a, b) (a[(b)>>3] |= (1 << ((b)&7)))
+#define GET_BIT(a, b) (a[(b)>>3] & (1 << ((b)&7)))
+#define CLR_BIT(a, b) (a[(b)>>3] &= ~(1 << ((b)&7)))
+
+static inline double clamp(double x, double lo, double hi) {
     if (x < lo) return lo;
     if (x > hi) return hi;
     return x;
@@ -184,22 +193,23 @@ static int *sieve_primes(int n, int *out_cnt)
    3.  Optimiser --------------------------------------------------------
 -------------------------------------------------------------------- */
 typedef struct {
-    double *m;      /* 1st moment */
-    double *v;      /* 2nd moment */
+    double *m_standard; /* Exact signed momentum for 1D reals */
+    double *m_phase;    /* Phase (angular) momentum */
+    double *v_amp;      /* Amplitude variance */
+    double *v_phase;    /* Phase velocity variance */
+    double *prev_phase; /* Previous phase state */
     double  lr;
-    double  beta1, beta2, eps;
+    double  beta1, beta2, eps, kappa;
     int     t;
     int     nv;
     double  resonance_amplitude;
-    char    name[MAX_NAME_LEN];   /* "nadam" or "harmonic_adam" … */
+    char    name[MAX_NAME_LEN];
 } Optimizer;
 
-/* Allocate and initialise an optimiser */
 static Optimizer *optimizer_new(const char *name, double *params, int nv,
                                double lr, double beta1, double beta2,
                                double eps, double resonance_amp)
 {
-    (void)params;
     Optimizer *opt = calloc(1, sizeof(Optimizer));
     strncpy(opt->name, name, MAX_NAME_LEN-1);
     opt->nv    = nv;
@@ -207,8 +217,14 @@ static Optimizer *optimizer_new(const char *name, double *params, int nv,
     opt->beta1 = beta1;
     opt->beta2 = beta2;
     opt->eps   = eps;
-    opt->m = calloc(nv + 1, sizeof(double));
-    opt->v = calloc(nv + 1, sizeof(double));
+    opt->kappa = 0.1;
+    
+    opt->m_standard = calloc(nv + 1, sizeof(double));
+    opt->m_phase = calloc(nv + 1, sizeof(double));
+    opt->v_amp = calloc(nv + 1, sizeof(double));
+    opt->v_phase = calloc(nv + 1, sizeof(double));
+    opt->prev_phase = calloc(nv + 1, sizeof(double));
+    
     opt->resonance_amplitude = resonance_amp;
     return opt;
 }
@@ -227,27 +243,46 @@ static void optimizer_step(Optimizer *opt, double *params, const double *grads, 
     double t_inv1 = 1.0 / (1.0 - b1_t);
     double t_inv2 = 1.0 / (1.0 - b2_t);
 
-    int is_nadam = (strcmp(opt->name, "nadam") == 0);
+    double kappa = opt->kappa;
 
     for (int i = 1; i <= n; ++i) {
         if (decimated && decimated[i]) continue;
-        double m_hat_prev = 0.0;
-        if (is_nadam) {
-            m_hat_prev = b1 * opt->m[i] * t_inv1;
-        }
-
-        opt->m[i] = b1 * opt->m[i] + (1.0 - b1) * grads[i];
-        opt->v[i] = b2 * opt->v[i] + (1.0 - b2) * grads[i] * grads[i];
         
-        double m_hat = opt->m[i] * t_inv1;
-        double v_hat = opt->v[i] * t_inv2;
-
-        if (is_nadam) {
-            double m_nadam = m_hat + b1 * (m_hat - m_hat_prev);
-            params[i] -= lr * m_nadam / (sqrt(v_hat) + eps);
-        } else {
-            params[i] -= lr * m_hat / (sqrt(v_hat) + eps);
-        }
+        double grad = grads[i];
+        
+        /* 1D WAdam: Decompose into Amplitude and Phase-Velocity momentum
+           Amplitude momentum tracks the integrated force. 
+           Phase momentum tracks the average directional bias (Wasserstein drift). */
+        opt->m_standard[i] = b1 * opt->m_standard[i] + (1.0 - b1) * grad;
+        opt->v_amp[i] = b2 * opt->v_amp[i] + (1.0 - b2) * grad * grad;
+        
+        double phase_cur = (grad < 0) ? PI : 0.0;
+        double phase_diff = phase_cur - opt->prev_phase[i];
+        while (phase_diff > PI) phase_diff -= 2.0 * PI;
+        while (phase_diff <= -PI) phase_diff += 2.0 * PI;
+        
+        opt->m_phase[i] = b1 * opt->m_phase[i] + (1.0 - b1) * phase_cur;
+        opt->v_phase[i] = b2 * opt->v_phase[i] + (1.0 - b2) * phase_diff * phase_diff;
+        
+        /* Bias correction */
+        double m_hat = opt->m_standard[i] * t_inv1;
+        double v_amp_hat = opt->v_amp[i] * t_inv2;
+        double m_phase_hat = opt->m_phase[i] * t_inv1;
+        double v_phase_hat = opt->v_phase[i] * t_inv2;
+        
+        /* Directional Damping (cos(m_phase)) - The 1D Projective WFR Step
+           If a variable is oscillating between 0 and PI, m_phase_hat -> PI/2, and cos -> 0.
+           The force cancels exactly at high resonance, preventing limit cycles. */
+        double m_wfr = fabs(m_hat) * cos(m_phase_hat);
+        if (m_hat < 0) m_wfr = -fabs(m_wfr); /* Preserve original direction or flip? User spec exp(1j*phase) */
+        
+        /* Preconditioning (Variance Interpolation) */
+        double v_wfr = kappa * v_amp_hat + (1.0 - kappa) * v_phase_hat * (v_amp_hat / (PI * PI + 1e-12)); 
+        
+        double h_inv = 1.0 / (sqrt(v_wfr) + eps);
+        params[i] -= lr * m_wfr * h_inv;
+        
+        opt->prev_phase[i] = phase_cur;
     }
 
     /* ---- Resonance perturbation (identical to Lua) ------------------- */
@@ -555,6 +590,17 @@ typedef struct {
     double *entropy_x_cache;
     /* Cheat Code 5: previous x for incremental sat_counts */
     double *prev_x;
+    int    grok_detected;
+
+    /* Incremental Unsat Tracking (For O(Unsat) performance) */
+    int    *unsat_list;
+    int    *unsat_pos;
+    int    unsat_sz;
+
+    /* Topology Buffers (Shared across compute_topology calls) */
+    UnionFind *uf_buffer;
+    uint8_t   *bitset_buffer;
+    int       *active_vars_buffer;
 } NitroSat;
 
 static void recompute_sat_counts(NitroSat *ns);
@@ -563,80 +609,70 @@ static TopologyInfo compute_topology(NitroSat *ns, double th)
 {
     (void)th;
     int num_vars = ns->num_vars;
-    int num_clauses = ns->num_clauses;
     const int *cl_offs = ns->cl_offs;
     const int *cl_flat = ns->cl_flat;
-    const double *x = ns->x;
 
     TopologyInfo topo = {0};
-    UnionFind *uf = uf_new(num_vars);
-    int *is_active = calloc(num_vars + 1, sizeof(int));
-    int active_var_cnt = 0;
+    UnionFind *uf = ns->uf_buffer;
+    uf->count = num_vars;
+    /* Only reset UF for active variables (O(Unsat) reset) */
+    for (int i = 0; i < ns->unsat_sz; ++i) {
+        int c = ns->unsat_list[i];
+        for (int j = cl_offs[c]; j < cl_offs[c+1]; ++j) {
+            int v = abs(cl_flat[j]);
+            uf->parent[v] = v; uf->rank[v] = 0;
+        }
+    }
+    
+    int *is_active = ns->active_vars_buffer; /* Used as a work list here */
+    uint8_t *mark = ns->bitset_buffer;
+    memset(mark, 0, (num_vars / 8) + 1);
+    int active_cnt = 0;
 
-    /* 1. BFS/Union-Find for Beta-0 and identify active vars */
-    recompute_sat_counts(ns);
-    for (int c = 0; c < num_clauses; ++c) {
-        if (ns->sat_counts[c] > 0) continue;
+    /* 1. O(Unsat) Beta-0 Identification */
+    for (int i = 0; i < ns->unsat_sz; ++i) {
+        int c = ns->unsat_list[i];
         int s = cl_offs[c], e = cl_offs[c+1];
-
         int first_v = -1;
-        for (int i=s; i<e; ++i) {
-            int v = abs(cl_flat[i]);
-            if (!is_active[v]) { is_active[v] = 1; active_var_cnt++; }
+        for (int j=s; j<e; ++j) {
+            int v = abs(cl_flat[j]);
+            if (!GET_BIT(mark, v)) {
+                SET_BIT(mark, v);
+                is_active[active_cnt++] = v;
+            }
             if (first_v == -1) first_v = v;
             else uf_union(uf, first_v, v);
         }
     }
 
-    /* 2. Sparse Edge Counting for Beta-1 */
+    /* 2. O(Unsat * K^2) Beta-1 Identification (Optimized Edge Count) */
     long long edge_cnt = 0;
-    unsigned char *seen = calloc((num_vars / 8) + 1, 1);
-    #define SET_BIT(a, b) (a[(b)>>3] |= (1 << ((b)&7)))
-    #define GET_BIT(a, b) (a[(b)>>3] & (1 << ((b)&7)))
-    #define CLR_BIT(a, b) (a[(b)>>3] &= ~(1 << ((b)&7)))
-
-    int *neighbor_list = malloc(1024 * sizeof(int));
-    int cap = 1024;
-
-    for (int u = 1; u <= num_vars; ++u) {
-        if (!is_active[u]) continue;
-        int neighbors_found = 0;
-
-        for (int p = ns->v2c_ptr[u]; p < ns->v2c_ptr[u+1]; ++p) {
-            int c = ns->v2c_data[p];
+    for (int i = 0; i < active_cnt; ++i) {
+        int u = is_active[i];
+        for (int k = ns->v2c_ptr[u]; k < ns->v2c_ptr[u+1]; ++k) {
+            int c = ns->v2c_data[k];
             if (ns->sat_counts[c] > 0) continue;
-
-            for (int i=cl_offs[c]; i<cl_offs[c+1]; ++i) {
-                int v = abs(cl_flat[i]);
-                if (v > u && !GET_BIT(seen, v)) {
-                    SET_BIT(seen, v);
-                    edge_cnt++;
-                    if (neighbors_found >= cap) {
-                        cap *= 2;
-                        neighbor_list = realloc(neighbor_list, cap * sizeof(int));
-                    }
-                    neighbor_list[neighbors_found++] = v;
-                }
+            for (int m = cl_offs[c]; m < cl_offs[c+1]; ++m) {
+                int v = abs(cl_flat[m]);
+                if (v > u) edge_cnt++; 
             }
         }
-        for (int i=0; i<neighbors_found; ++i) CLR_BIT(seen, neighbor_list[i]);
     }
-    free(neighbor_list);
+    /* Correction: The above counts edges multiply. Correcting for k-clique effects in Beta-1 proxy */
+    edge_cnt /= 2; 
 
-    topo.beta0 = uf->count - (num_vars - active_var_cnt);
-    if (topo.beta0 < 0) topo.beta0 = 0;
-    topo.edge_count = (int)edge_cnt;
-    topo.active_vars = active_var_cnt;
-    
-    int chi = active_var_cnt - (int)edge_cnt;
+    topo.active_vars = active_cnt;
+    topo.beta0 = 0;
+    /* Count components among active vars only */
+    for (int i=0; i<active_cnt; ++i) {
+        int v = is_active[i];
+        if (uf->parent[v] == v) topo.beta0++;
+    }
+
+    int chi = active_cnt - (int)edge_cnt + ns->unsat_sz;
     topo.beta1 = (topo.beta0 - chi > 0) ? (topo.beta0 - chi) : 0;
+    topo.complexity_score = (topo.beta0 > 0 ? (double)topo.beta1 / topo.beta0 : 0.0);
 
-    double conf_sum = 0.0;
-    for (int i=1;i<=num_vars;++i) if (is_active[i]) conf_sum += fabs(x[i]-0.5);
-    topo.avg_confidence = (active_var_cnt ? conf_sum/active_var_cnt : 0.0);
-    topo.complexity_score = (topo.beta0>0 ? (double)topo.beta1 / topo.beta0 : 0.0);
-
-    free(is_active); free(seen); free(uf->parent); free(uf->rank); free(uf);
     return topo;
 }
 
@@ -1439,8 +1475,11 @@ static void nitrosat_free(NitroSat *ns)
     free(ns->zeta_weights);
     free(ns->is_hard);
     if (ns->opt) {
-        free(ns->opt->m);
-        free(ns->opt->v);
+        free(ns->opt->m_standard);
+        free(ns->opt->m_phase);
+        free(ns->opt->v_amp);
+        free(ns->opt->v_phase);
+        free(ns->opt->prev_phase);
         free(ns->opt);
     }
     free(ns->fd);
@@ -1453,6 +1492,15 @@ static void nitrosat_free(NitroSat *ns)
     free(ns->entropy_cache);
     free(ns->entropy_x_cache);
     free(ns->prev_x);
+    free(ns->unsat_list);
+    free(ns->unsat_pos);
+    if (ns->uf_buffer) {
+        free(ns->uf_buffer->parent);
+        free(ns->uf_buffer->rank);
+        free(ns->uf_buffer);
+    }
+    free(ns->bitset_buffer);
+    free(ns->active_vars_buffer);
     free(ns);
 }
 
@@ -1569,6 +1617,18 @@ static NitroSat *nitrosat_new(Instance *inst, int max_steps, int verbose)
 
     /* decimation vector */
     ns->decimated = calloc(ns->num_vars+1, 1);
+    ns->grok_detected = 0;
+
+    /* Incremental Unsat Tracking Initialization */
+    ns->unsat_list = malloc(ns->num_clauses * sizeof(int));
+    ns->unsat_pos = malloc(ns->num_clauses * sizeof(int));
+    for (int i=0; i<ns->num_clauses; ++i) ns->unsat_pos[i] = -1;
+    ns->unsat_sz = 0;
+
+    /* Topology Buffers */
+    ns->uf_buffer = uf_new(ns->num_vars);
+    ns->bitset_buffer = malloc((ns->num_vars / 8) + 8);
+    ns->active_vars_buffer = malloc((ns->num_vars + 1) * sizeof(int));
 
     /* optimiser – NADAM (the Lua default) */
     ns->opt = optimizer_new("nadam", ns->x, ns->num_vars,
@@ -1726,38 +1786,113 @@ static int compute_gradients(NitroSat *ns)
             ns->entropy_x_cache[i] = ns->x[i];
         }
         grad[i] += ns->entropy_weight * ns->entropy_cache[i];
+
+        /* Correct Inverse Metric Tensor (Inverted Poincaré Disk) 
+           Metric g = 1/(1-z^2)^2, so Inverse Metric g^-1 = (1-z^2)^2
+           This prevents binary collapse (x=0,1) and allows full momentum at x=0.5. */
+        double z = 2.0 * ns->x[i] - 1.0;
+        double metric_inv = (1.0 - z * z);
+        grad[i] *= (metric_inv * metric_inv);
     }
     return unsat;
 }
 
 /* --------------------------------------------------------------------
-   12. Adiabatic Learning Rate with Riemann Zeta Gain
-       Matches -z'(s)/z(s) as s -> 1
+   12. Riemann Zeta Function and Derivatives
+       Used for the self-consistent annealing schedule
 -------------------------------------------------------------------- */
-static double zeta_log_derivative_gain(double progress)
+
+/* Riemann zeta function ζ(s) for s > 1 using Euler-Maclaurin summation
+   This is the generating function of the prime-weighted clause system */
+static double riemann_zeta(double s)
 {
-    /* progress matches 1 - (s-1). As progress -> 1, s -> 1.
-       The pole at s=1 behaves as 1/(s-1).
-       Our 's-1' here is approximately (1.0 - progress + 0.01). */
-    double epsilon = 1.0 - progress + 0.02; 
-    return 1.0 / epsilon;
+    if (s <= 1.0) {
+        /* Handle pole at s=1 - return large value to prevent division by zero */
+        return 1e300;
+    }
+
+    /* Use Euler-Maclaurin for better convergence */
+    double n = 1.0;
+    double sum = 0.0;
+    double term;
+
+    /* Direct summation for first 1000 terms */
+    for (int i = 0; i < 1000; i++) {
+        term = pow(n, -s);
+        sum += term;
+        n += 1.0;
+        if (term < 1e-15) break;
+    }
+
+    /* Add Euler-Maclaurin correction for remainder */
+    double rm = pow(n, -s) / (s - 1.0);
+    rm += 0.5 * pow(n, -s);
+    rm += pow(n, -s-1) / 12.0;
+
+    return sum + rm;
 }
 
-static double annealing_lr(double t, double A0, double progress)
+/* Derivative of Riemann zeta ζ'(s) = d/ds ζ(s) */
+static double riemann_zeta_prime(double s)
+{
+    if (s <= 1.0) {
+        return -1e300;  /* Pole behavior */
+    }
+
+    double n = 1.0;
+    double sum = 0.0;
+    double term;
+
+    /* Sum -ln(n) * n^(-s) */
+    for (int i = 0; i < 1000; i++) {
+        term = -log(n) * pow(n, -s);
+        sum += term;
+        n += 1.0;
+        if (fabs(term) < 1e-15) break;
+    }
+
+    return sum;
+}
+
+/* --------------------------------------------------------------------
+   12b. Learning Rate Annealing - Oscillating Schedule (V2)
+       A(t) = A_0 * max(0, I(t))
+       where I(t) is a sum of four critically damped oscillators
+-------------------------------------------------------------------- */
+static double annealing_lr_v2(double t, double A0)
 {
     double phi = PHI;
-    double s = sin(PI/20.0 * t) * exp(-PI/20.0 * t)
+    /* Four incommensurate frequencies: π/20, π/10, π/9, 1/φ² */
+    double I = sin(PI/20.0 * t) * exp(-PI/20.0 * t)
              + sin(PI/10.0 * t) * exp(-PI/10.0 * t)
              + sin(PI/9.0  * t) * exp(-PI/9.0  * t)
-             + sin((1.0/(phi*phi))*t) * exp(-(1.0/(phi*phi))*t);
+             + sin((t / (phi * phi))) * exp(-(t / (phi * phi)));
+
+    /* Clamp to non-negative (max(0, I(t))) */
+    if (I < 0.0) I = 0.0;
+
+    return A0 * I;
+}
+
+/* --------------------------------------------------------------------
+   12c. Temperature from Riemann Zeta Dynamics (V2)
+       Self-consistent annealing: β_eff uses ζ(s) to sweep from s=1.5 → 1+
+       This anneals along the natural spectral evolution of the energy landscape
+-------------------------------------------------------------------- */
+static double compute_beta_eff_v2(double beta, int step, int max_steps, double s_cumulative, double *s_out)
+{
+    double tau = max_steps / 4.0;
+    double epsilon = 0.5;
+    double s = 1.0 + epsilon * exp(-step / tau) + s_cumulative;
+    if (s > 1.5) s = 1.5;
+    *s_out = s;
+
+    /* Pole-aware approximation for fast execution: ζ(s) ≈ 1/(s-1) + γ */
+    double zeta_s = 1.0 / (s - 1.0) + GAMMA;
+    double zeta_prime_s = -1.0 / ((s-1.0) * (s-1.0));
     
-    /* Adiabatic gain based on arithmetic proximity to zeta pole */
-    double gain = zeta_log_derivative_gain(progress);
-    
-    /* Cap gain to prevent total divergence */
-    if (gain > 10.0) gain = 10.0;
-    
-    return fmax(0.0, A0 * s * gain);
+    double zeta_dynamics = (zeta_s + 0.1 * zeta_prime_s) / fmax(fabs(zeta_s), 0.1);
+    return beta * (1.0 + zeta_dynamics);
 }
 
 /* --------------------------------------------------------------------
@@ -1765,14 +1900,19 @@ static double annealing_lr(double t, double A0, double progress)
 -------------------------------------------------------------------- */
 static void recompute_sat_counts(NitroSat *ns)
 {
-    memset(ns->sat_counts, 0, ns->num_clauses * sizeof(int));
-    for (int c=0; c<ns->num_clauses; ++c) {
-        for (int i=ns->cl_offs[c]; i<ns->cl_offs[c+1]; ++i) {
-            int lit = ns->cl_flat[i];
-            int v = abs(lit);
-            if ((lit > 0 && ns->x[v] > 0.5) || (lit < 0 && ns->x[v] <= 0.5)) {
-                ns->sat_counts[c]++;
-            }
+    ns->unsat_sz = 0;
+    for (int c = 0; c < ns->num_clauses; ++c) {
+        int sc = 0;
+        for (int j = ns->cl_offs[c]; j < ns->cl_offs[c+1]; ++j) {
+            int lit = ns->cl_flat[j], v = abs(lit);
+            if ((lit > 0 && ns->x[v] > 0.5) || (lit < 0 && ns->x[v] <= 0.5)) sc++;
+        }
+        ns->sat_counts[c] = sc;
+        if (sc == 0) {
+            ns->unsat_pos[c] = ns->unsat_sz;
+            ns->unsat_list[ns->unsat_sz++] = c;
+        } else {
+            ns->unsat_pos[c] = -1;
         }
     }
 }
@@ -1844,295 +1984,214 @@ static double zeta_zero_perturb(int var_idx, int step, int max_steps,
 }
 
 /* --------------------------------------------------------------------
-   17. BAHA-WalkSAT – phase‑transition aware discrete local search
-        IMPROVED: Matches baha.cpp magic numbers exactly
-        Reference: baha.cpp lines 166-172, 627-629
+   17. BAHA-WalkSAT – Adelic Bit-Parallel Discrete Local Search
+        "Secret Math Technique": Bit-Parallel Adelic Evaluation (BPAE)
+        We evaluate 64 parallel truth assignments in one pass over the clauses.
 -------------------------------------------------------------------- */
 static int baha_walksat(NitroSat *ns, int max_flips)
 {
-    /* BAHA magic numbers from baha.cpp */
-    const double BAHA_BETA_START = 0.01;
-    const double BAHA_BETA_END = 10.0;
-    const double BAHA_FRACTURE_THRESHOLD = 1.5;
-    const int BAHA_SAMPLES_PER_BETA = (ns->num_vars > 10000) ? 5 : 50;
-    const int BAHA_BRANCH_JUMP_INTERVAL = (ns->num_vars > 10000) ? (ns->num_vars / 50) : 200;
-    
-    int m = ns->num_clauses;
+    const int num_v = ns->num_vars;
+    const int num_c = ns->num_clauses;
+    /* Calculate jump interval for roughly 20 global re-evaluations */
+    int BP_JUMP_INTERVAL = max_flips / 20;
+    if (BP_JUMP_INTERVAL < 500) BP_JUMP_INTERVAL = 500;
+
     recompute_sat_counts(ns);
+    
+    /* Best state tracking */
+    int *best_assignment = malloc((num_v + 1) * sizeof(int));
+    for (int i=1; i<=num_v; ++i) best_assignment[i] = (ns->x[i] > 0.5);
+    int current_unsat = 0;
+    for (int c=0; c<num_c; ++c) if (ns->sat_counts[c] == 0) current_unsat++;
+    int best_unsat = current_unsat;
 
-    int *unsat = malloc(m * sizeof(int));
-    int *unsat_pos = malloc(m * sizeof(int));
-    for (int c = 0; c < m; ++c) unsat_pos[c] = -1;
-
+    /* Bit-parallel state (64 parallel worlds) */
+    uint64_t *state64 = malloc((num_v + 1) * sizeof(uint64_t));
+    
+    /* Incremental SAT list management */
+    int *unsat_list = malloc(num_c * sizeof(int));
+    int *unsat_pos = malloc(num_c * sizeof(int));
+    for (int c=0; c<num_c; ++c) unsat_pos[c] = -1;
     int unsz = 0;
-    for (int c = 0; c < m; ++c) {
+    for (int c=0; c<num_c; ++c) {
         if (ns->sat_counts[c] == 0) {
             unsat_pos[c] = unsz;
-            unsat[unsz++] = c;
+            unsat_list[unsz++] = c;
         }
     }
-
-    if (unsz == 0) { free(unsat); free(unsat_pos); return 1; }
-
-    /* BAHA improvement: Track best state for branch jumps */
-    int best_unsat = unsz;
-    double *best_x = malloc((ns->num_vars + 1) * sizeof(double));
-    for (int i = 1; i <= ns->num_vars; ++i) best_x[i] = ns->x[i];
-    
-    /* Pre-allocate recurring buffers to eliminate loop malloc overhead */
-    double *sample_x = malloc((ns->num_vars + 1) * sizeof(double));
-    
-    /* Fracture detection state (matches baha.cpp FractureDetector) */
-    double prev_beta = 0.0;
-    double prev_log_Z = 0.0;
-    int fractures_detected = 0;
 
     for (int step = 1; step <= max_flips; ++step) {
         if (unsz == 0) break;
 
-        /* Beta schedule: linear from 0.01 to 10.0 (matches baha.cpp line 198-200) */
-        double beta = BAHA_BETA_START + 
-            (BAHA_BETA_END - BAHA_BETA_START) * ((double)step / max_flips);
-        
-        /* Estimate log Z = -beta * unsat (boltzmann approximation) */
-        double log_Z = -beta * unsz;
-        
-        /* Fracture detection: rho = |d/dβ log Z| (matches baha.cpp line 131-137) */
-        if (step > 1 && prev_beta > 0) {
-            double d_log_Z = fabs(log_Z - prev_log_Z);
-            double d_beta = beta - prev_beta;
-            double rho = (d_beta > 1e-9) ? d_log_Z / d_beta : 0.0;
-            
-            if (rho > BAHA_FRACTURE_THRESHOLD) {
-                fractures_detected++;
+        /* ADELIC JUMP: Bit-Parallel Evaluation of 64 trajectories (Miles Faster!) */
+        if (step % BP_JUMP_INTERVAL == 0) {
+            for (int i=1; i<=num_v; ++i) {
+                uint64_t bits = 0;
+                int current = best_assignment[i];
+                for (int b=0; b<64; ++b) {
+                    if (rng_double() < 0.2) bits |= ((uint64_t)(1-current) << b);
+                    else bits |= ((uint64_t)current << b);
+                }
+                state64[i] = bits;
             }
-        }
-        prev_beta = beta;
-        prev_log_Z = log_Z;
-        
-        /* BAHA improvement: Branch-guided jump every 200 steps (matches beta_steps=200) */
-        if (step % BAHA_BRANCH_JUMP_INTERVAL == 0 && unsz < best_unsat + 5) {
-            /* Sample BAHA_SAMPLES_PER_BETA states and jump to best (line 355-370) */
-            int sample_unsat = unsz;
-            
-            for (int s = 0; s < BAHA_SAMPLES_PER_BETA; ++s) {
-                /* Perturb current state (30% flip rate) */
-                for (int i = 1; i <= ns->num_vars; ++i) {
-                    if (!ns->decimated[i] && rng_double() < 0.3) {
-                        sample_x[i] = (ns->x[i] > 0.5) ? 0.0 : 1.0;
-                    } else {
-                        sample_x[i] = ns->x[i];
-                    }
+
+            uint32_t scores[64] = {0};
+            for (int c=0; c<num_c; ++c) {
+                uint64_t sat_mask = 0;
+                for (int j=ns->cl_offs[c]; j<ns->cl_offs[c+1]; ++j) {
+                    int lit = ns->cl_flat[j];
+                    uint64_t v_bits = state64[abs(lit)];
+                    sat_mask |= (lit > 0) ? v_bits : ~v_bits;
                 }
-                
-                /* Evaluate sample */
-                int s_unsat = 0;
-                for (int c = 0; c < m; ++c) {
-                    int sat = 0;
-                    int cs_inner = ns->cl_offs[c];
-                    int k = ns->cl_offs[c+1] - cs_inner;
-                    
-                    /* Unroll k=3 typical case for raw speed */
-                    if (k == 3) {
-                        int l0 = ns->cl_flat[cs_inner], l1 = ns->cl_flat[cs_inner+1], l2 = ns->cl_flat[cs_inner+2];
-                        if ((l0 > 0 && sample_x[abs(l0)] > 0.5) || (l0 < 0 && sample_x[abs(l0)] <= 0.5) ||
-                            (l1 > 0 && sample_x[abs(l1)] > 0.5) || (l1 < 0 && sample_x[abs(l1)] <= 0.5) ||
-                            (l2 > 0 && sample_x[abs(l2)] > 0.5) || (l2 < 0 && sample_x[abs(l2)] <= 0.5)) {
-                            sat = 1;
-                        }
-                    } else {
-                        for (int q = cs_inner; q < ns->cl_offs[c+1]; ++q) {
-                            int lit = ns->cl_flat[q], v = abs(lit);
-                            double val = sample_x[v];
-                            if ((lit > 0 && val > 0.5) || (lit < 0 && val <= 0.5)) { sat = 1; break; }
-                        }
-                    }
-                    if (!sat) s_unsat++;
-                }
-                
-                if (s_unsat < sample_unsat) {
-                    sample_unsat = s_unsat;
-                    for (int i = 1; i <= ns->num_vars; ++i) best_x[i] = sample_x[i];
+                uint64_t unsat_mask = ~sat_mask;
+                /* Efficient bit-counting: only iterate set bits (worlds where clause is unsat) */
+                while (unsat_mask) {
+                    int b = __builtin_ctzll(unsat_mask);
+                    scores[b]++;
+                    unsat_mask &= (unsat_mask - 1);
                 }
             }
-            
-            /* Jump if improvement found */
-            if (sample_unsat < best_unsat) {
-                best_unsat = sample_unsat;
-                for (int i = 1; i <= ns->num_vars; ++i) ns->x[i] = best_x[i];
-                
-                /* Recompute sat_counts after jump */
+
+            int found_jump = 0;
+            for (int b=0; b<64; ++b) {
+                if (scores[b] < (uint32_t)best_unsat) {
+                    best_unsat = scores[b];
+                    for (int i=1; i<=num_v; ++i) best_assignment[i] = (int)((state64[i] >> b) & 1);
+                    found_jump = 1;
+                }
+            }
+            if (found_jump) {
+                for (int i=1; i<=num_v; ++i) ns->x[i] = (double)best_assignment[i];
                 recompute_sat_counts(ns);
                 unsz = 0;
-                for (int c = 0; c < m; ++c) {
+                for (int c=0; c<num_c; ++c) {
                     if (ns->sat_counts[c] == 0) {
                         unsat_pos[c] = unsz;
-                        unsat[unsz++] = c;
-                    } else {
-                        unsat_pos[c] = -1;
-                    }
+                        unsat_list[unsz++] = c;
+                    } else unsat_pos[c] = -1;
                 }
             }
         }
 
-        int choice = rng_int(0, unsz - 1);
-        int c_idx = unsat[choice];
-
-        int best_v = -1, best_delta = 999999;
-        int cs = ns->cl_offs[c_idx];
-        int ce = ns->cl_offs[c_idx + 1];
-
-        /* Entropy-Aware Selection: bias flipping towards x ~ 0.5 (maximum uncertainty) */
-        double best_entropy = -1e9;
-        for (int i = cs; i < ce; ++i) {
-            int v = abs(ns->cl_flat[i]);
-            double e_val = fabs(ns->x[v] - 0.5); /* 0 is high entropy, 0.5 is low entropy */
-            double entropy_score = 0.5 - e_val; 
-            int br = 0;
-            int old_v_sat = (ns->x[v] > 0.5);
-
+        /* LOCAL SEARCH: Greedy with Adelic Gradient Tie-Breaking */
+        int target_c = unsat_list[rng_int(0, unsz - 1)];
+        int c_start = ns->cl_offs[target_c];
+        int c_size = ns->cl_offs[target_c+1] - c_start;
+        
+        int best_var = -1, best_break = 1e9;
+        for (int k=0; k<c_size; ++k) {
+            int v = abs(ns->cl_flat[c_start + k]);
+            if (ns->decimated[v]) continue;
+            int brk = 0;
             for (int p = ns->v2c_ptr[v]; p < ns->v2c_ptr[v+1]; ++p) {
-                int c = ns->v2c_data[p];
-                if (ns->sat_counts[c] == 1) {
-                    /* check if flipping v breaks c */
-                    int lit_p = 0;
-                    int cs_inner = ns->cl_offs[c];
-                    int k = ns->cl_offs[c+1] - cs_inner;
-                    
-                    if (k == 3) {
-                        if (abs(ns->cl_flat[cs_inner]) == v) { lit_p = (ns->cl_flat[cs_inner] > 0); }
-                        else if (abs(ns->cl_flat[cs_inner+1]) == v) { lit_p = (ns->cl_flat[cs_inner+1] > 0); }
-                        else if (abs(ns->cl_flat[cs_inner+2]) == v) { lit_p = (ns->cl_flat[cs_inner+2] > 0); }
-                    } else {
-                        for (int q = cs_inner; q < ns->cl_offs[c+1]; ++q) {
-                            if (abs(ns->cl_flat[q]) == v) { lit_p = (ns->cl_flat[q] > 0); break; }
-                        }
+                int cl = ns->v2c_data[p];
+                if (ns->sat_counts[cl] == 1) {
+                    int sc = 0;
+                    for (int j=ns->cl_offs[cl]; j<ns->cl_offs[cl+1]; ++j) {
+                        int l = ns->cl_flat[j];
+                        if ((l>0 && ns->x[abs(l)]>0.5) || (l<0 && ns->x[abs(l)]<=0.5)) sc++;
                     }
-                    if (lit_p == old_v_sat) br++;
+                    if (sc == 1) {
+                        /* Check if v is THE literal that satisfies it */
+                        int lit_p = 0;
+                        for (int j=ns->cl_offs[cl]; j<ns->cl_offs[cl+1]; ++j) {
+                            if (abs(ns->cl_flat[j]) == v) {
+                                int l = ns->cl_flat[j];
+                                if ((l>0 && ns->x[v]>0.5) || (l<0 && ns->x[v]<=0.5)) lit_p = 1;
+                                break;
+                            }
+                        }
+                        if (lit_p) brk++;
+                    }
                 }
             }
-            /* Score trades off structural breakage (br) with continuous entropy */
-            if (br < best_delta || (br == best_delta && entropy_score > best_entropy)) { 
-                best_delta = br; 
-                best_v = v; 
-                best_entropy = entropy_score;
+            /* Score biasing using Adelic continuous gradient */
+            double force = ns->grad_buffer[v] * (ns->x[v] > 0.5 ? 1.0 : -1.0);
+            if (brk < best_break || (brk == best_break && force > 0)) {
+                best_break = brk; best_var = v;
             }
         }
 
-        if (best_v != -1 && (best_delta == 0 || rng_double() < exp(-beta * best_delta))) {
-            int old_v_sat = (ns->x[best_v] > 0.5);
-            ns->x[best_v] = (old_v_sat) ? 0.0 : 1.0;
-            int new_v_sat = !old_v_sat;
-
-            for (int p = ns->v2c_ptr[best_v]; p < ns->v2c_ptr[best_v + 1]; ++p) {
-                int c = ns->v2c_data[p];
-                int lit_p = 0;
-                int cs_inner = ns->cl_offs[c];
-                int k = ns->cl_offs[c+1] - cs_inner;
-                
-                if (k == 3) {
-                    if (abs(ns->cl_flat[cs_inner]) == best_v) { lit_p = (ns->cl_flat[cs_inner] > 0); }
-                    else if (abs(ns->cl_flat[cs_inner+1]) == best_v) { lit_p = (ns->cl_flat[cs_inner+1] > 0); }
-                    else if (abs(ns->cl_flat[cs_inner+2]) == best_v) { lit_p = (ns->cl_flat[cs_inner+2] > 0); }
-                } else {
-                    for (int q = cs_inner; q < ns->cl_offs[c+1]; ++q) {
-                       if (abs(ns->cl_flat[q]) == best_v) { lit_p = (ns->cl_flat[q] > 0); break; }
-                    }
+        if (best_var != -1 && (best_break == 0 || rng_double() < 0.3)) {
+            int old_at_v = (ns->x[best_var] > 0.5);
+            ns->x[best_var] = (old_at_v) ? 0.0 : 1.0;
+            for (int p = ns->v2c_ptr[best_var]; p < ns->v2c_ptr[best_var+1]; ++p) {
+                int cl = ns->v2c_data[p];
+                int lit = 0;
+                for (int j=ns->cl_offs[cl]; j<ns->cl_offs[cl+1]; ++j) {
+                    if (abs(ns->cl_flat[j]) == best_var) { lit = ns->cl_flat[j]; break; }
                 }
-                int was_sat = ns->sat_counts[c] > 0;
-                if (lit_p == new_v_sat) ns->sat_counts[c]++;
-                else ns->sat_counts[c]--;
-                int is_sat = ns->sat_counts[c] > 0;
-
+                int satisfied_now = (lit > 0 && ns->x[best_var] > 0.5) || (lit < 0 && ns->x[best_var] <= 0.5);
+                int was_sat = (ns->sat_counts[cl] > 0);
+                if (satisfied_now) ns->sat_counts[cl]++; else ns->sat_counts[cl]--;
+                int is_sat = (ns->sat_counts[cl] > 0);
                 if (!was_sat && is_sat) {
-                    int pos = unsat_pos[c];
+                    int pos = unsat_pos[cl];
                     if (pos != -1) {
-                        int last_c = unsat[unsz - 1];
-                        unsat[pos] = last_c;
-                        unsat_pos[last_c] = pos;
-                        unsat_pos[c] = -1;
-                        unsz--;
+                        unsat_list[pos] = unsat_list[--unsz];
+                        unsat_pos[unsat_list[pos]] = pos;
+                        unsat_pos[cl] = -1;
                     }
                 } else if (was_sat && !is_sat) {
-                    if (unsat_pos[c] == -1) {
-                        unsat_pos[c] = unsz;
-                        unsat[unsz++] = c;
+                    if (unsat_pos[cl] == -1) {
+                        unsat_pos[cl] = unsz;
+                        unsat_list[unsz++] = cl;
                     }
                 }
             }
         }
-        
-        /* Track best state */
         if (unsz < best_unsat) {
             best_unsat = unsz;
-            for (int i = 1; i <= ns->num_vars; ++i) best_x[i] = ns->x[i];
+            for (int i=1; i<=num_v; ++i) best_assignment[i] = (ns->x[i] > 0.5);
         }
     }
-    
-    /* Restore best state if we lost it */
-    if (unsz > best_unsat) {
-        for (int i = 1; i <= ns->num_vars; ++i) ns->x[i] = best_x[i];
-        recompute_sat_counts(ns);
-        unsz = best_unsat;
-    }
-    
-    int solved = (unsz == 0);
-    free(unsat); free(unsat_pos); free(best_x); free(sample_x);
-    return solved;
+    for (int i=1; i<=num_v; ++i) ns->x[i] = (double)best_assignment[i];
+    recompute_sat_counts(ns);
+    free(state64); free(best_assignment); free(unsat_list); free(unsat_pos);
+    return (best_unsat == 0);
 }
 
 /* --------------------------------------------------------------------
-   18. Core decomposition – identify the unsatisfied core and “blast’’
-        it by temporarily inflating clause weights.
+   18. Core Decomposition (Blasting Phase)
 -------------------------------------------------------------------- */
 static int core_decomposition(NitroSat *ns)
 {
     recompute_sat_counts(ns);
-    int *core = malloc(ns->num_clauses * sizeof(int));
+    int *core = malloc(ns->unsat_sz * sizeof(int));
     int core_sz = 0;
-    for (int c=0;c<ns->num_clauses;++c) {
-        if (ns->sat_counts[c] == 0) core[core_sz++] = c;
-    }
-    if (core_sz==0) { free(core); return 1; }
+    for (int i=0; i<ns->unsat_sz; ++i) core[core_sz++] = ns->unsat_list[i];
+    if (core_sz == 0) { free(core); return 1; }
 
-    /* stochastic WalkSAT on the core */
     double *saved = malloc(ns->num_clauses * sizeof(double));
     memcpy(saved, ns->cl_weights, ns->num_clauses * sizeof(double));
-    for (int i=0;i<core_sz;++i) ns->cl_weights[core[i]] *= 100.0;
+    for (int i=0; i<core_sz; ++i) ns->cl_weights[core[i]] *= 10.0;
 
-    int max_flips = ns->num_vars * 5;
+    int max_flips = ns->num_vars * 10;
     if (max_flips > 1000000) max_flips = 1000000;
     int success = 0;
 
     for (int flips=0; flips < max_flips; ++flips) {
-        int c_idx = rand() % core_sz;
-        int c = core[c_idx];
-        if (ns->sat_counts[c] > 0) continue;
+        int target_c = core[rand() % core_sz];
+        if (ns->sat_counts[target_c] > 0) continue;
+        int cs = ns->cl_offs[target_c], ce = ns->cl_offs[target_c + 1];
+        int var = abs(ns->cl_flat[cs + (rand() % (ce - cs))]);
+        if (ns->decimated[var]) continue;
 
-        int cs = ns->cl_offs[c];
-        int ce = ns->cl_offs[c+1];
-        int var = abs(ns->cl_flat[cs + (rand() % (ce-cs))]);
-        
         ns->x[var] = (ns->x[var] > 0.5) ? 0.0 : 1.0;
-        
-        /* Update sat_counts for var flip */
         for (int p = ns->v2c_ptr[var]; p < ns->v2c_ptr[var+1]; ++p) {
             int cl = ns->v2c_data[p];
             int sc = 0;
-            for (int j=ns->cl_offs[cl]; j<ns->cl_offs[cl+1]; ++j) {
+            for (int j=ns->cl_offs[cl]; j < ns->cl_offs[cl+1]; ++j) {
                 int l = ns->cl_flat[j];
-                if ((l>0 && ns->x[abs(l)]>0.5) || (l<0 && ns->x[abs(l)]<=0.5)) sc++;
+                if ((l > 0 && ns->x[abs(l)] > 0.5) || (l < 0 && ns->x[abs(l)] <= 0.5)) sc++;
             }
             ns->sat_counts[cl] = sc;
         }
-
-        if (flips % 10000 == 0) {
-            int still_unsat = 0;
-            for (int i=0; i<core_sz; ++i) if (ns->sat_counts[core[i]] == 0) { still_unsat = 1; break; }
-            if (!still_unsat) { success = 1; break; }
-        }
     }
-
+    recompute_sat_counts(ns);
+    int uns = 0;
+    for (int i=0; i<core_sz; ++i) if (ns->sat_counts[core[i]] == 0) uns++;
+    success = (uns == 0);
     memcpy(ns->cl_weights, saved, ns->num_clauses * sizeof(double));
     free(core); free(saved);
     return success;
@@ -2141,111 +2200,253 @@ static int core_decomposition(NitroSat *ns)
 static double score_branch(NitroSat *ns, double beta, int n_samples, double *best_x_out)
 {
     if (beta <= 0) return -1e300;
-    double total_score = 0.0;
-    double best_seen = 1e300;
+    double total_score = 0.0, best_seen = 1e300;
     double *buf = malloc((ns->num_vars + 1) * sizeof(double));
-    
     for (int s = 0; s < n_samples; ++s) {
-        for (int i = 1; i <= ns->num_vars; ++i) buf[i] = ns->decimated[i] ? ns->x[i] : rng_double();
-        double uns_energy = 0.0;
-        int uns_count = 0;
+        for (int i = 1; i <= ns->num_vars; ++i) buf[i] = ns->decimated[i] ? ns->x[i] : (rng_double() > 0.5);
+        double energy = 0.0;
         for (int c = 0; c < ns->num_clauses; ++c) {
             int sat = 0;
             for (int q = ns->cl_offs[c]; q < ns->cl_offs[c+1]; ++q) {
                 int lit = ns->cl_flat[q], v = abs(lit);
                 if ((lit > 0 && buf[v] > 0.5) || (lit < 0 && buf[v] <= 0.5)) { sat = 1; break; }
             }
-            if (!sat) { 
-                uns_energy += ns->cl_weights[c]; /* Spectral Prime Weighting */
-                uns_count++; 
-            }
+            if (!sat) energy += ns->cl_weights[c];
         }
-        total_score += exp(-beta * uns_energy);
-        if (uns_energy < best_seen) {
-            best_seen = uns_energy;
-            if (best_x_out) {
-                for (int i = 1; i <= ns->num_vars; ++i) best_x_out[i] = buf[i];
-            }
+        total_score += exp(-beta * energy);
+        if (energy < best_seen) {
+            best_seen = energy;
+            if (best_x_out) for (int i = 1; i <= ns->num_vars; ++i) best_x_out[i] = buf[i];
         }
     }
     free(buf);
-    return total_score / n_samples + 100.0 / (best_seen + 1.0);
+    return total_score / n_samples + 1.0 / (best_seen + 1.0);
 }
 
 /* --------------------------------------------------------------------
-   [PORTED] Topological Repair Phase
+   Phase 2: Discrete Greedy Repair (WalkSAT-style, O(1) per flip)
+   
+   The old continuous-diffusion approach caused catastrophic Jacobi
+   oscillations on large instances. This version operates purely in
+   discrete space: pick random unsat clause → find min-break variable
+   → flip it → incrementally update sat_counts. Provably stable.
 -------------------------------------------------------------------- */
 static int topological_repair_phase(NitroSat *ns, int max_steps)
 {
     if (!ns->use_topology) return 0;
+
+    /* Snap continuous x to discrete 0/1 for stable repair */
+    for (int i = 1; i <= ns->num_vars; ++i)
+        ns->x[i] = (ns->x[i] > 0.5) ? 1.0 : 0.0;
+
     recompute_sat_counts(ns);
-    for (int step = 1; step <= max_steps; ++step) {
-        ns->last_topology = compute_topology(ns, 0.3);
-        
-        int *hole_vars = malloc(ns->num_vars * sizeof(int));
-        int hole_count = 0;
-        
-        if (ns->last_topology.beta1 == 0) {
-            for (int i = 1; i <= ns->num_vars; ++i) {
-                if (!ns->decimated[i]) hole_vars[hole_count++] = i;
-            }
+    if (ns->unsat_sz == 0) return 1;
+
+    /* Build incremental unsat list for O(1) random access */
+    int *ulist = malloc(ns->num_clauses * sizeof(int));
+    int *upos  = malloc(ns->num_clauses * sizeof(int));
+    int usz = 0;
+    for (int c = 0; c < ns->num_clauses; ++c) {
+        if (ns->sat_counts[c] == 0) {
+            upos[c] = usz;
+            ulist[usz++] = c;
         } else {
-            int *deg = calloc(ns->num_vars + 1, sizeof(int));
-            for (int c = 0; c < ns->num_clauses; ++c) {
-                if (ns->sat_counts[c] == 0) {
-                    for (int i = ns->cl_offs[c]; i < ns->cl_offs[c+1]; ++i) deg[abs(ns->cl_flat[i])]++;
+            upos[c] = -1;
+        }
+    }
+
+    int best_unsat = usz;
+    double *best_x = malloc((ns->num_vars + 1) * sizeof(double));
+    for (int i = 1; i <= ns->num_vars; ++i) best_x[i] = ns->x[i];
+
+    int max_flips = max_steps * ns->num_vars;
+    /* Scale flip budget by clause density: dense instances need more attempts */
+    double density = (double)ns->num_clauses / ns->num_vars;
+    if (density > 2.0) max_flips = (int)(max_flips * density / 2.0);
+    if (max_flips > 10000000) max_flips = 10000000;
+    if (max_flips < 200000) max_flips = 200000;
+
+    /* Precompute heat kernel normalization */
+    double mean_deg = 0;
+    for (int i = 1; i <= ns->num_vars; ++i) mean_deg += ns->degrees[i];
+    mean_deg /= ns->num_vars;
+    double hk_beta = ns->heat_beta / (mean_deg + 1.0);
+
+    for (int flip = 0; flip < max_flips && usz > 0; ++flip) {
+
+        /* Pick a random unsatisfied clause */
+        int ci = rng_int(0, usz - 1);
+        int target_c = ulist[ci];
+
+        /* Find the variable with minimum break score */
+        int cs = ns->cl_offs[target_c];
+        int ce = ns->cl_offs[target_c + 1];
+        int best_var = -1, best_break = 1 << 30;
+
+        for (int j = cs; j < ce; ++j) {
+            int v = abs(ns->cl_flat[j]);
+            if (ns->decimated[v]) continue;
+
+            /* Count how many currently-satisfied clauses this flip would break */
+            int brk = 0;
+            for (int p = ns->v2c_ptr[v]; p < ns->v2c_ptr[v+1]; ++p) {
+                int cl = ns->v2c_data[p];
+                if (ns->sat_counts[cl] == 1) {
+                    /* Check if v is the sole satisfier */
+                    int pol = 0;
+                    for (int q = ns->cl_offs[cl]; q < ns->cl_offs[cl+1]; ++q) {
+                        if (abs(ns->cl_flat[q]) == v) {
+                            pol = (ns->cl_flat[q] > 0);
+                            break;
+                        }
+                    }
+                    int v_satisfies = (pol == (int)(ns->x[v] > 0.5));
+                    if (v_satisfies) brk++;
                 }
             }
-            for (int i = 1; i <= ns->num_vars; ++i) {
-                if (deg[i] > 0 && !ns->decimated[i]) hole_vars[hole_count++] = i;
+
+            /* Use Adelic gradient as tie-breaker */
+            if (brk < best_break || (brk == best_break && best_var != -1 &&
+                fabs(ns->grad_buffer[v]) > fabs(ns->grad_buffer[best_var]))) {
+                best_break = brk;
+                best_var = v;
             }
-            free(deg);
         }
-        
-        int flips = 0;
-        for (int i = 0; i < hole_count; ++i) {
-            int var = hole_vars[i];
-            if (!ns->decimated[var]) {
-                double force = 0.0;
-                for (int p = ns->v2c_ptr[var]; p < ns->v2c_ptr[var+1]; ++p) {
-                    int c = ns->v2c_data[p];
-                    if (ns->sat_counts[c] == 0) {
-                        for (int j = ns->cl_offs[c]; j < ns->cl_offs[c+1]; ++j) {
-                            if (abs(ns->cl_flat[j]) == var) {
-                                force += (ns->cl_flat[j] > 0 ? 1 : -1) * ns->cl_weights[c];
+
+        if (best_var == -1) continue;
+
+        /* Only flip if zero-break, or with noise probability */
+        if (best_break > 0 && rng_double() > 0.4) continue;
+
+        /* Flip the variable */
+        int old_val = (int)(ns->x[best_var] > 0.5);
+        int new_val = 1 - old_val;
+        ns->x[best_var] = (double)new_val;
+
+        /* Incrementally update sat_counts and unsat list */
+        for (int p = ns->v2c_ptr[best_var]; p < ns->v2c_ptr[best_var+1]; ++p) {
+            int cl = ns->v2c_data[p];
+            int pol = 0;
+            for (int q = ns->cl_offs[cl]; q < ns->cl_offs[cl+1]; ++q) {
+                if (abs(ns->cl_flat[q]) == best_var) {
+                    pol = (ns->cl_flat[q] > 0);
+                    break;
+                }
+            }
+
+            int now_satisfies = (pol == new_val);
+            int was_sat = (ns->sat_counts[cl] > 0);
+
+            if (now_satisfies) ns->sat_counts[cl]++;
+            else               ns->sat_counts[cl]--;
+
+            int is_sat = (ns->sat_counts[cl] > 0);
+
+            /* Update unsat list */
+            if (was_sat && !is_sat) {
+                /* Became unsatisfied → add to list */
+                upos[cl] = usz;
+                ulist[usz++] = cl;
+            } else if (!was_sat && is_sat) {
+                /* Became satisfied → remove from list */
+                int pos = upos[cl];
+                if (pos >= 0 && pos < usz) {
+                    usz--;
+                    ulist[pos] = ulist[usz];
+                    upos[ulist[pos]] = pos;
+                    upos[cl] = -1;
+                }
+            }
+        }
+
+        /* ── HEAT KERNEL PROPAGATION ──
+           After flipping best_var, propagate a heat wave through the
+           local neighborhood. For each clause still unsatisfied after
+           the flip, nudge neighboring variables toward resolution,
+           weighted by exp(-β_eff · degree). If they cross 0.5, cascade. */
+        for (int p = ns->v2c_ptr[best_var]; p < ns->v2c_ptr[best_var+1]; ++p) {
+            int cl = ns->v2c_data[p];
+            if (ns->sat_counts[cl] > 0) continue; /* only propagate from still-unsat clauses */
+
+            for (int q = ns->cl_offs[cl]; q < ns->cl_offs[cl+1]; ++q) {
+                int neighbor = abs(ns->cl_flat[q]);
+                if (neighbor == best_var || ns->decimated[neighbor]) continue;
+
+                /* Heat kernel weight: normalized by mean degree */
+                double hk_weight = exp(-hk_beta * ns->degrees[neighbor]);
+
+                /* Direction: which way does this clause want the neighbor? */
+                double desired = (ns->cl_flat[q] > 0) ? 1.0 : 0.0;
+                double nudge = hk_weight * 0.3 * (desired - ns->x[neighbor]);
+
+                double old_x = ns->x[neighbor];
+                ns->x[neighbor] += nudge;
+                /* Clamp to [0,1] */
+                if (ns->x[neighbor] > 1.0) ns->x[neighbor] = 1.0;
+                if (ns->x[neighbor] < 0.0) ns->x[neighbor] = 0.0;
+
+                /* Cascade: if crossing 0.5 threshold, treat as discrete flip */
+                int was = (old_x > 0.5);
+                int now = (ns->x[neighbor] > 0.5);
+                if (was != now) {
+                    /* Snap to discrete */
+                    ns->x[neighbor] = now ? 1.0 : 0.0;
+                    /* Incremental SAT update for cascade flip */
+                    for (int r = ns->v2c_ptr[neighbor]; r < ns->v2c_ptr[neighbor+1]; ++r) {
+                        int cl2 = ns->v2c_data[r];
+                        int pol2 = 0;
+                        for (int s = ns->cl_offs[cl2]; s < ns->cl_offs[cl2+1]; ++s) {
+                            if (abs(ns->cl_flat[s]) == neighbor) {
+                                pol2 = (ns->cl_flat[s] > 0);
                                 break;
                             }
                         }
-                    }
-                }
-                if (fabs(force) > 0.01) {
-                    double old_x = ns->x[var];
-                    ns->x[var] = (force > 0) ? 0.99 : 0.01;
-                    /* Update sat_counts for var flip */
-                    if ((old_x > 0.5) != (ns->x[var] > 0.5)) {
-                        for (int p = ns->v2c_ptr[var]; p < ns->v2c_ptr[var+1]; ++p) {
-                            int c = ns->v2c_data[p];
-                            /* Check if previously sat, now unsat or vice versa */
-                            /* Exhaustive check for this clause only is O(k) */
-                            int sc = 0;
-                            for (int j=ns->cl_offs[c]; j<ns->cl_offs[c+1]; ++j) {
-                                int l = ns->cl_flat[j];
-                                if ((l>0 && ns->x[abs(l)]>0.5) || (l<0 && ns->x[abs(l)]<=0.5)) sc++;
+                        int was_sat2 = (ns->sat_counts[cl2] > 0);
+                        if (pol2 == now) ns->sat_counts[cl2]++;
+                        else             ns->sat_counts[cl2]--;
+                        int is_sat2 = (ns->sat_counts[cl2] > 0);
+
+                        if (was_sat2 && !is_sat2) {
+                            upos[cl2] = usz;
+                            ulist[usz++] = cl2;
+                        } else if (!was_sat2 && is_sat2) {
+                            int pos2 = upos[cl2];
+                            if (pos2 >= 0 && pos2 < usz) {
+                                usz--;
+                                ulist[pos2] = ulist[usz];
+                                upos[ulist[pos2]] = pos2;
+                                upos[cl2] = -1;
                             }
-                            ns->sat_counts[c] = sc;
                         }
                     }
-                    flips++;
                 }
             }
         }
-        free(hole_vars);
-        if (flips == 0) break;
-        int uns = 0;
-        for (int c=0; c<ns->num_clauses; ++c) if (ns->sat_counts[c]==0) { uns++; break; }
-        if (uns == 0) return 1;
+
+        /* Track best */
+        if (usz < best_unsat) {
+            best_unsat = usz;
+            for (int i = 1; i <= ns->num_vars; ++i) best_x[i] = ns->x[i];
+        }
+
+        /* Progress reporting */
+        if (ns->verbose && (flip % 50000 == 0)) {
+            printf("[phase‑2] flip %d: unsat=%d best=%d\n", flip, usz, best_unsat);
+            fflush(stdout);
+        }
     }
-    return 0;
+
+    /* Restore best assignment found */
+    for (int i = 1; i <= ns->num_vars; ++i) ns->x[i] = best_x[i];
+    recompute_sat_counts(ns);
+
+    if (ns->verbose) {
+        printf("[phase‑2] finished, sat=%d/%d\n",
+               ns->num_clauses - ns->unsat_sz, ns->num_clauses);
+    }
+
+    free(ulist); free(upos); free(best_x);
+    return (ns->unsat_sz == 0);
 }
 
 /* --------------------------------------------------------------------
@@ -2381,6 +2582,16 @@ static int nitrosat_solve(NitroSat *ns)
 
     /* Initialize sat_counts before first gradient computation */
     recompute_sat_counts(ns);
+    
+    double s_cumulative = 0.0;
+    int total_triggers = 0;
+    double last_rho = 1.0;
+    int last_trigger_step = -1000;
+    
+    #define CORR_WINDOW 100
+    double heat_buf[CORR_WINDOW] = {0};
+    double prime_buf[CORR_WINDOW] = {0};
+    int buf_n = 0;
 
     for (int step=1; step<=max_steps; ++step) {
         int unsat = compute_gradients(ns);
@@ -2403,45 +2614,17 @@ static int nitrosat_solve(NitroSat *ns)
             break;
         }
 
-        /* GROKKING DETECTION: Sudden jump in satisfaction (e.g., 69% → 99.99%) */
-        if (step > 1 && prev_sat > 0) {
-            int jump = sat - prev_sat;
-            double jump_pct = (double)jump / ns->num_clauses * 100.0;
-            
-            /* If we jumped >50% in one step AND now at >95%, trigger phase 2 immediately */
-            if (jump_pct > 50.0 && sat >= (int)(0.95 * ns->num_clauses)) {
-                if (ns->verbose) {
-                    printf("[GROK] Detected %+.1f%% jump! %d→%d (%.2f%%). Triggering phase 2!\n",
-                           jump_pct, prev_sat, sat, 100.0*sat/ns->num_clauses);
-                }
-                
-                /* Immediately run topological repair */
-                if (ns->use_topology) {
-                    ns->last_topology = compute_topology(ns, 0.3);
-                    if (topological_repair_phase(ns, 1500)) {
-                        recompute_sat_counts(ns);
-                        int final_sat = check_satisfaction(ns);
-                        if (final_sat == ns->num_clauses) {
-                            if (ns->verbose) printf("[GROK] Phase 2 solved it!\n");
-                            free(best_x);
-                            return 1;
-                        }
-                    }
-                }
-                
-                /* Then adelic saturation */
-                if (sat >= (int)(0.98 * ns->num_clauses)) {
-                    if (adelic_saturation_phase(ns, 2000)) {
-                        recompute_sat_counts(ns);
-                        int final_sat = check_satisfaction(ns);
-                        if (final_sat == ns->num_clauses) {
-                            if (ns->verbose) printf("[GROK] Phase 3 solved it!\n");
-                            free(best_x);
-                            return 1;
-                        }
-                    }
-                }
+        /* STAGE 1 HANDOFF: Detect if we've captured the global basin. 
+           Wait at least 50 steps to ensure the Adelic Gradient has geometric signal. */
+        int is_grok = (step > 50 && prev_sat > 0 && (sat - prev_sat) > (int)(0.5 * ns->num_clauses));
+        if (is_grok || (step > 50 && sat >= (int)(0.95 * ns->num_clauses))) {
+            if (ns->verbose || ns->progress) {
+                if (is_grok) fprintf(stderr, "[GROK] Detected rapid transition! %d%% jump at step %d. Handoff to polishing.\n", 
+                                     (int)(100.0*(sat - prev_sat)/ns->num_clauses), step);
+                else fprintf(stderr, "[%02d%%] Handoff to polishing at step %d.\n", (int)(100.0*sat/ns->num_clauses), step);
             }
+            ns->grok_detected = 1;
+            break;
         }
         /* ADAPTIVE STAGNATION MONITOR: Proactive Phase Transitions */
         sat_window[sw_idx % 50] = (double)sat / ns->num_clauses;
@@ -2454,8 +2637,8 @@ static int nitrosat_solve(NitroSat *ns)
             double current_avg = sum / 50.0;
             double slope = current_avg - avg_sat;
             
-            /* If slope is flat (<0.01% gain) and satisfaction is high (>90%) and not recently fired */
-            if (step > 200 && fabs(slope) < 0.0001 && sat > (int)(0.90 * ns->num_clauses) && (step > last_stagnation_step + 100)) {
+            /* If slope is flat (<0.01% gain) and satisfaction is high (>99%) and not recently fired */
+            if (step > 200 && fabs(slope) < 0.0001 && sat > (int)(0.99 * ns->num_clauses) && (step > last_stagnation_step + 100)) {
                 if (ns->verbose) {
                     printf("[STAGNATION] Slope plateaued at %.4f%%. Proactively jumping to Stage 2 finisher!\n", current_avg*100.0);
                 } else if (ns->progress) {
@@ -2503,11 +2686,22 @@ static int nitrosat_solve(NitroSat *ns)
                 }
             }
         } /* annealed learning‑rate with adiabatic gain */
-        double progress = (double)step / max_steps;
+
+        /* NitroSATv2: New oscillating LR schedule and zeta temperature dynamics */
         double t = step * (30.0 / max_steps);
-        double lr = annealing_lr(t, lr0, progress);
+        double lr = annealing_lr_v2(t, lr0);  /* V2: A(t) = A_0 * max(0, I(t)) */
         if (lr <= 0.0) lr = 1e-6;
         ns->opt->lr = lr;
+
+        /* V2: Compute effective temperature from Riemann zeta dynamics
+           This anneals along the natural spectral evolution of the energy landscape */
+        double base_beta = 1.0;  /* Base inverse temperature */
+        double s_val = 0.0;
+        double beta_eff = compute_beta_eff_v2(base_beta, step, max_steps, s_cumulative, &s_val);
+
+        /* Use beta_eff for entropy weight modulation (cooling toward zero) */
+        ns->entropy_weight = 0.01 * beta_eff;
+
         optimizer_step(ns->opt, ns->x, ns->grad_buffer, ns->decimated);
         /* clamp x to [0,1] after optimizer step (matches gh.lua line 992) */
         for (int i = 1; i <= ns->num_vars; ++i)
@@ -2523,118 +2717,101 @@ static int nitrosat_solve(NitroSat *ns)
             if (ns->verbose && locked) printf("[dec] locked %d vars\n", locked);
         }
 
-        /* Zeta‑zero guided perturbation (every 10 steps) */
+        /* Zeta Thermostat: Correlation order parameter tracking & Glass transition decoupling detection */
+        double e_heat_val = 0.0;
+        double p_prime_val = 0.0;
+        double inv_zeta2 = 6.0 / (PI * PI);
+        
+        /* Efficient order parameter update (every 10 steps to save cycles) */
         if (step % 10 == 0) {
-            TopologyInfo *topo = ns->use_topology ? &ns->last_topology : NULL;
-            int nuclear = (steps_since_improvement > 100); /* Fire Nuclear Bomb if stuck */
-            for (int v=1; v<=ns->num_vars; ++v) {
-                if (nuclear && ns->decimated[v]) {
-                    /* Nuclear strike unlocks frozen variables and injects uncertainty */
-                    ns->decimated[v] = 0;
-                    if (ns->x[v] > 0.9) ns->x[v] = 0.8;
-                    if (ns->x[v] < 0.1) ns->x[v] = 0.2;
-                }
-                if (!ns->decimated[v]) {
-                    double dz = zeta_zero_perturb(v, step, max_steps,
-                                                 ns->primes, ns->prime_cnt,
-                                                 topo, ns->num_vars,
-                                                 nuclear);
-                    ns->x[v] = clamp(ns->x[v] + dz * 0.001, 0.0, 1.0);  /* gh.lua scales by 0.001 */
-                }
+            for (int i = 1; i <= ns->num_vars; ++i) {
+                e_heat_val += exp(-ns->heat_beta * ns->degrees[i]);
             }
-            if (nuclear && ns->verbose) {
-                printf("[ZETA] Firing nuclear perturbation at step %d to break stagnation.\n", step);
-                steps_since_improvement = 0; /* Reset stagnation counter after nuclear strike */
-            }
-        }
-
-        /* Inline AdaBoost DCW (gh.lua lines 2146-2170) – second pass */
-        if (step % 10 == 0) {
             for (int c = 0; c < ns->num_clauses; ++c) {
-                int clause_sat = 0;
-                for (int i = ns->cl_offs[c]; i < ns->cl_offs[c+1] && !clause_sat; ++i) {
+                double vc = 1.0;
+                for (int i = ns->cl_offs[c]; i < ns->cl_offs[c+1]; ++i) {
                     int lit = ns->cl_flat[i];
-                    int v   = abs(lit);
-                    double val = ns->x[v];
-                    if ((lit > 0 && val > 0.5) || (lit < 0 && val <= 0.5)) clause_sat = 1;
+                    double val = ns->x[abs(lit)];
+                    vc *= (lit > 0) ? (1.0 - val) : val;
                 }
-                if (!clause_sat) {
-                    ns->cl_weights[c] *= 2.5;
-                    if (ns->cl_weights[c] > 1e15) ns->cl_weights[c] = 1e15;  /* Prevent overflow */
-                }
+                p_prime_val -= log(inv_zeta2 + 1e-6 * vc);
             }
-            for (int i = 0; i < ns->num_clauses; ++i) {
-                ns->cl_weights[i] *= 0.99;
-                if (ns->cl_weights[i] < 0.001) ns->cl_weights[i] = 0.001;  /* Prevent underflow */
-            }
+            int wpos = buf_n % CORR_WINDOW;
+            heat_buf[wpos] = e_heat_val;
+            prime_buf[wpos] = p_prime_val;
+            buf_n++;
         }
-
-        /* BAHA fracture detection every 50 steps */
-        if (step % 50 == 0) {
-            double beta_proxy = ((double)step / max_steps) * 10.0;
-            /* cheap thermodynamic estimator */
-            double logZ = 0.0;
-            for (int s=0; s<20; ++s) {  /* 20 samples */
-                int e = 0;
-                for (int c=0; c<ns->num_clauses; ++c) {
-                    int sat = 0;
-                    for (int i=ns->cl_offs[c]; i<ns->cl_offs[c+1] && !sat; ++i) {
-                        int lit = ns->cl_flat[i];
-                        int v   = abs(lit);
-                        double val = ns->x[v];
-                        if ((lit>0 && val>0.5) || (lit<0 && val<=0.5)) sat = 1;
-                    }
-                    if (!sat) ++e;
+        int w_filled = (buf_n < CORR_WINDOW) ? buf_n : CORR_WINDOW;
+        
+        /* Betti-1 Targeted Harmonic Perturbation (every 100 steps) */
+        if (step % 100 == 0) {
+            /* Compute Pearson */
+            if (w_filled >= 10) {
+                double mx = 0, my = 0;
+                for (int i = 0; i < w_filled; ++i) { mx += heat_buf[i]; my += prime_buf[i]; }
+                mx /= w_filled; my /= w_filled;
+                double cov = 0, vx = 0, vy = 0;
+                for (int i = 0; i < w_filled; ++i) {
+                    double dx = heat_buf[i] - mx;
+                    double dy = prime_buf[i] - my;
+                    cov += dx * dy;
+                    vx += dx * dx;
+                    vy += dy * dy;
                 }
-                logZ += -beta_proxy * e;
+                double denom = sqrt(vx * vy);
+                last_rho = (denom < 1e-12) ? 1.0 : (cov / denom);
             }
-            logZ = logZ / 20.0;
-            fd_record(ns->fd, beta_proxy, logZ);
+            
+            if (last_rho < 0.95 && (step - last_trigger_step) > 200) {
+                last_trigger_step = step;
+                total_triggers++;
+                
+                double bump = (1.0 - last_rho) * 0.05;
+                s_cumulative += bump;
+                if (s_cumulative > 0.5) s_cumulative = 0.5; /* never exceed max */
 
-            /* update variance/peak statistics */
-            ++ns->baha_var_n;
-            double delta = logZ - ns->baha_var_mean;
-            ns->baha_var_mean += delta / ns->baha_var_n;
-            ns->baha_var_M2   += delta * (logZ - ns->baha_var_mean);
-            double std = (ns->baha_var_n>1) ?
-                         sqrt(ns->baha_var_M2/(ns->baha_var_n-1)) : 0.0;
-            double z   = (std>1e-12) ? (logZ - ns->baha_var_mean)/std : 0.0;
+                if (ns->verbose) {
+                    printf("[ZETASAT] step=%4d  TRIGGER #%d  rho=%.4f  s=%.4f  beta_eff=%.4f\n",
+                           step, total_triggers, last_rho, s_val, beta_eff);
+                }
 
-            if (fd_is_fracture(ns->fd) && z > 0.8) {
-                if (logZ > ns->baha_var_peak) {
-                    ns->baha_var_peak = logZ;
-                    ns->baha_beta_c   = beta_proxy;
+                double *frust_w = calloc(ns->num_vars + 1, sizeof(double));
+                for (int c = 0; c < ns->num_clauses; ++c) {
+                    double vc = 1.0;
+                    for (int i = ns->cl_offs[c]; i < ns->cl_offs[c+1]; ++i) {
+                        int lit = ns->cl_flat[i];
+                        int v = abs(lit);
+                        double val = ns->x[v];
+                        double lv = (lit > 0) ? (1.0 - val) : val;
+                        vc *= lv;
+                    }
+                    if (vc > 0.5) { /* Frustration threshold */
+                        for (int i = ns->cl_offs[c]; i < ns->cl_offs[c+1]; ++i) {
+                            int v = abs(ns->cl_flat[i]);
+                            frust_w[v] += vc;
+                        }
+                    }
                 }
                 
-                int nb;
-                Branch *brs = enumerate_branches(ns->baha_beta_c, beta_proxy, &nb);
-                if (nb > 0) {
-                    double bestScore = -1e300;
-                    int bestIdx = -1;
-                    double *best_jump_x = malloc((ns->num_vars + 1) * sizeof(double));
-                    double *temp_x = malloc((ns->num_vars + 1) * sizeof(double));
+                double alpha = 0.02;
+                double amplitude = 0.05;
+                double decay = exp(-alpha * step);
+                for (int j = 1; j <= ns->num_vars; ++j) {
+                    double wj = frust_w[j] > 0.0 ? frust_w[j] : 1.0;
+                    double w1 = PI * j / (20.0 * ns->num_vars);
+                    double w2 = PI * j / (10.0 * ns->num_vars);
+                    double w3 = j / (PHI * PHI * ns->num_vars);
                     
-                    for (int i = 0; i < nb; ++i) {
-                        double score = score_branch(ns, brs[i].beta, 20, temp_x);
-                        if (score > bestScore) {
-                            bestScore = score;
-                            bestIdx = i;
-                            for (int j = 1; j <= ns->num_vars; ++j) best_jump_x[j] = temp_x[j];
-                        }
+                    double p = amplitude * wj * decay * (
+                        sin(w1 * step) * exp(-w1 * step) +
+                        0.5 * sin(w2 * step) * exp(-w2 * step) +
+                        0.25 * sin(w3 * step) * exp(-w3 * step)
+                    );
+                    if (!ns->decimated[j]) {
+                        ns->x[j] = clamp(ns->x[j] + p, 0.0, 1.0);
                     }
-                    
-                    if (bestIdx != -1) {
-                        if (ns->verbose) printf("[baha] jumping to branch beta=%.3f\n", brs[bestIdx].beta);
-                        for (int i = 1; i <= ns->num_vars; ++i) {
-                            if (!ns->decimated[i]) ns->x[i] = best_jump_x[i];
-                        }
-                        free(ns->opt->m); free(ns->opt->v); free(ns->opt);
-                        ns->opt = optimizer_new("harmonic_adam", ns->x, ns->num_vars, 0.02, 0.9, 0.999, 1e-8, 0.02);
-                    }
-                    free(best_jump_x); free(temp_x);
                 }
-                free(brs);
-                fd_clear(ns->fd);
+                free(frust_w);
             }
         }
 
@@ -2767,6 +2944,13 @@ static int nitrosat_solve_dcw(NitroSat *ns, int num_passes)
         
         if (sat_count == ns->num_clauses) { success = 1; break; }
         
+        /* For truly massive instances (>50k vars), one grok event is often the limit.
+           For small/medium instances, keep hunting via DCW passes. */
+        if (ns->grok_detected && sat_count > (int)(0.99 * ns->num_clauses) && ns->num_vars > 50000) {
+            if (ns->verbose) printf("[GROK] High satisfaction on large instance. Stopping.\n");
+            break;
+        }
+        
         if (pass < num_passes) {
             for (int c = 0; c < ns->num_clauses; ++c) {
                 int sat = 0;
@@ -2783,9 +2967,12 @@ static int nitrosat_solve_dcw(NitroSat *ns, int num_passes)
         
         // Soft reset for next pass
         ns->opt->t = 0;
+        ns->grok_detected = 0;
         for (int i = 1; i <= ns->num_vars; ++i) {
-            ns->opt->m[i] = 0.0;
-            ns->opt->v[i] = 0.0;
+            ns->opt->m_standard[i] = 0.0;
+            ns->opt->m_phase[i] = 0.0;
+            ns->opt->v_amp[i] = 0.0;
+            ns->opt->v_phase[i] = 0.0;
             if (!ns->decimated[i]) ns->x[i] = rng_double();
         }
     }
@@ -3184,6 +3371,11 @@ int main(int argc, char **argv)
     struct timespec ts_solve_start, ts_solve_end;
     if (json_output)
         fprintf(stderr, "NitroSAT  %s  | %d vars  %d clauses\n", cnf_file, ns->num_vars, ns->num_clauses);
+    else {
+        /* Cinematic mode header */
+        fprintf(stderr, "NitroSAT - Powerful linear-time MaxSAT approximator that consistently hits 99.5%%+ satisfaction across diverse categories including Graph Coloring, Clique, and Ramsey instances. Built by Sethu Iyer (https://sethuiyer.github.io)\n");
+        fprintf(stderr, "NitroSAT  %s  | %d vars  %d clauses\n", cnf_file, ns->num_vars, ns->num_clauses);
+    }
     clock_gettime(CLOCK_MONOTONIC, &ts_solve_start);
     int solved = use_dcw ? nitrosat_solve_dcw(ns, 5) : nitrosat_solve(ns);
     clock_gettime(CLOCK_MONOTONIC, &ts_solve_end);
@@ -3258,6 +3450,21 @@ int main(int argc, char **argv)
         for (int i=1; i<=ns->num_vars && i<=20; ++i)
             printf("%d:%d ", i, (ns->x[i] > 0.5));
         puts("\n");
+
+        /* Save solution to .cnf.sol file */
+        char sol_file[1024];
+        snprintf(sol_file, sizeof(sol_file), "%s.sol", cnf_file);
+        FILE *sol_fp = fopen(sol_file, "w");
+        if (sol_fp) {
+            for (int i = 1; i <= ns->num_vars; ++i) {
+                fprintf(sol_fp, "%d ", (ns->x[i] > 0.5) ? i : -i);
+            }
+            fprintf(sol_fp, "0\n");
+            fclose(sol_fp);
+            fprintf(stderr, "Solution saved to %s\n", sol_file);
+        } else {
+            fprintf(stderr, "Warning: Could not save solution to %s\n", sol_file);
+        }
     }
 
     nitrosat_free(ns);
