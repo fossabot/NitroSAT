@@ -3,6 +3,7 @@
 # NitroSAT
 
 ![NitroSAT Logo](img/logo.png)
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fsethuiyer%2FNitroSAT.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2Fsethuiyer%2FNitroSAT?ref=badge_shield)
 
 **A High-Performance O(M) MaxSAT Solver Using Physics-Informed Continuous Relaxation**. Made in India by [Shunyabar Labs](https://shunyabar.foo/).
 
@@ -246,6 +247,9 @@ NitroSAT is licensed under the Apache License 2.0. See the [LICENSE](LICENSE) fi
 
 ---
 
+
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fsethuiyer%2FNitroSAT.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2Fsethuiyer%2FNitroSAT?ref=badge_large)
+
 ## Support & Contributing
 
 - **Issues**: Report bugs and feature requests via GitHub Issues
@@ -254,4 +258,3 @@ NitroSAT is licensed under the Apache License 2.0. See the [LICENSE](LICENSE) fi
 - **Sponsor**: Support development at [github.com/sponsors/sethuiyer](https://github.com/sponsors/sethuiyer/)
 
 Contributions are welcome. Please follow the [Code of Conduct](CODE_OF_CONDUCT.md).
-
